@@ -1,0 +1,187 @@
++			out.header.payloadSize != size - HeaderSize) { return false; }
++		out.header.type = static_cast<PacketType>(type);
++		out.payload = data + HeaderSize;
++		out.payloadSize = out.header.payloadSize;
++		return true;
++	}
++
++	bool encodeHello(const Header& header, const Hello& payload, Datagram& out)
++	{
++		return encode(header, [&](Writer& writer) {
++			return writer.u32(payload.nonce) && writer.u32(payload.contentHash) &&
++				writer.string(payload.playerName, MaxPlayerName);
++		}, out);
++	}
++	bool decodeHello(const PacketView& packet, Hello& out)
++	{
++		Reader reader(packet.payload, packet.payloadSize);
++		return packet.header.type == PacketType::Hello && reader.u32(out.nonce) &&
++			reader.u32(out.contentHash) && reader.string(out.playerName, MaxPlayerName) && reader.remaining() == 0;
++	}
++
++	bool encodeWelcome(const Header& header, const Welcome& payload, Datagram& out)
++	{
++		return encode(header, [&](Writer& writer) {
++			return writer.u32(payload.nonce) && writer.u8(payload.playerSlot) &&
++				writer.u8(payload.accepted) && writer.u16(payload.reason);
++		}, out);
++	}
++	bool decodeWelcome(const PacketView& packet, Welcome& out)
++	{
++		Reader reader(packet.payload, packet.payloadSize);
++		return packet.header.type == PacketType::Welcome && reader.u32(out.nonce) &&
++			reader.u8(out.playerSlot) && reader.u8(out.accepted) && reader.u16(out.reason) && reader.remaining() == 0;
++	}
++
++	bool encodePlayerState(const Header& header, const PlayerState& p, Datagram& out)
++	{
++		return encode(header, [&](Writer& w) {
++			return w.u32(p.simulationTick) && w.u32(p.levelHash) && w.i32(p.x) && w.i32(p.y) && w.i32(p.z) &&
++				w.i16(p.yaw) && w.i16(p.pitch) && w.i16(p.sectorIndex) && w.u8(p.weapon) && w.u8(p.flags) &&
++				w.i16(p.health) && w.i16(p.shields) && w.u16(p.triggerGoals) && w.u16(p.itemGoals);
++		}, out);
++	}
++	bool decodePlayerState(const PacketView& packet, PlayerState& p)
++	{
++		Reader r(packet.payload, packet.payloadSize);
++		return packet.header.type == PacketType::PlayerState && r.u32(p.simulationTick) && r.u32(p.levelHash) &&
++			r.i32(p.x) && r.i32(p.y) && r.i32(p.z) && r.i16(p.yaw) && r.i16(p.pitch) && r.i16(p.sectorIndex) &&
++			r.u8(p.weapon) && r.u8(p.flags) && r.i16(p.health) && r.i16(p.shields) &&
++			r.u16(p.triggerGoals) && r.u16(p.itemGoals) && r.remaining() == 0;
++	}
++
++	bool encodeProjectileEvent(const Header& header, const ProjectileEvent& p, Datagram& out)
++	{
++		return encode(header, [&](Writer& w) {
++			return w.u32(p.eventId) && w.u32(p.levelHash) && w.i32(p.x) && w.i32(p.y) && w.i32(p.z) &&
++				w.i16(p.yaw) && w.i16(p.pitch) && w.i16(p.sectorIndex) && w.u16(p.projectileType) &&
++				w.i16(p.bounceCount) && w.i32(p.speed) && w.i32(p.damage) && w.i32(p.minDamage) &&
++				w.u32(p.remainingTicks) && w.u8(p.flags);
++		}, out);
++	}
++	bool decodeProjectileEvent(const PacketView& packet, ProjectileEvent& p)
++	{
++		Reader r(packet.payload, packet.payloadSize);
++		return packet.header.type == PacketType::ProjectileEvent && r.u32(p.eventId) && r.u32(p.levelHash) &&
++			r.i32(p.x) && r.i32(p.y) && r.i32(p.z) && r.i16(p.yaw) && r.i16(p.pitch) &&
++			r.i16(p.sectorIndex) && r.u16(p.projectileType) && r.i16(p.bounceCount) &&
++			r.i32(p.speed) && r.i32(p.damage) && r.i32(p.minDamage) && r.u32(p.remainingTicks) &&
++			r.u8(p.flags) && r.remaining() == 0;
++	}
++
++	bool encodeUseEvent(const Header& header, const UseEvent& p, Datagram& out)
++	{
++		return encode(header, [&](Writer& w) {
++			return w.u32(p.eventId) && w.u32(p.levelHash) && w.i32(p.x) && w.i32(p.y) && w.i32(p.z) &&
++				w.i16(p.yaw) && w.i16(p.pitch) && w.i16(p.sectorIndex);
++		}, out);
++	}
++	bool decodeUseEvent(const PacketView& packet, UseEvent& p)
++	{
++		Reader r(packet.payload, packet.payloadSize);
++		return packet.header.type == PacketType::UseEvent && r.u32(p.eventId) && r.u32(p.levelHash) &&
++			r.i32(p.x) && r.i32(p.y) && r.i32(p.z) && r.i16(p.yaw) && r.i16(p.pitch) &&
++			r.i16(p.sectorIndex) && r.remaining() == 0;
++	}
++
++	bool encodeAck(const Header& header, const Ack& p, Datagram& out)
++	{
++		return encode(header, [&](Writer& w) {
++			return w.u8(static_cast<std::uint8_t>(p.acknowledgedType)) && w.u32(p.eventId);
++		}, out);
++	}
++	bool decodeAck(const PacketView& packet, Ack& p)
++	{
++		Reader r(packet.payload, packet.payloadSize);
++		std::uint8_t type;
++		if (packet.header.type != PacketType::Ack || !r.u8(type) || !r.u32(p.eventId) || r.remaining() != 0) { return false; }
++		p.acknowledgedType = static_cast<PacketType>(type);
++		return p.eventId != 0 && (p.acknowledgedType == PacketType::ProjectileEvent ||
++			p.acknowledgedType == PacketType::UseEvent);
++	}
++
++	bool encodePing(const Header& header, PacketType type, const Ping& p, Datagram& out)
++	{
++		if (type != PacketType::Ping && type != PacketType::Pong) { return false; }
++		Header actual = header;
++		actual.type = type;
++		return encode(actual, [&](Writer& w) { return w.u64(p.timestampMs); }, out);
++	}
++	bool decodePing(const PacketView& packet, Ping& p)
++	{
++		if (packet.header.type != PacketType::Ping && packet.header.type != PacketType::Pong) { return false; }
++		Reader r(packet.payload, packet.payloadSize);
++		return r.u64(p.timestampMs) && r.remaining() == 0;
++	}
++
++	bool encodeDisconnect(const Header& header, std::uint16_t reason, Datagram& out)
++	{
++		return encode(header, [&](Writer& w) { return w.u16(reason); }, out);
++	}
++	bool decodeDisconnect(const PacketView& packet, std::uint16_t& reason)
++	{
++		Reader r(packet.payload, packet.payloadSize);
++		return packet.header.type == PacketType::Disconnect && r.u16(reason) && r.remaining() == 0;
++	}
++}
++}
+diff --git a/TheForceEngine/TFE_DarkForces/Coop/coopProtocol.h b/TheForceEngine/TFE_DarkForces/Coop/coopProtocol.h
+new file mode 100644
+index 0000000..9ec160d
+--- /dev/null
++++ b/TheForceEngine/TFE_DarkForces/Coop/coopProtocol.h
+@@ -0,0 +1,158 @@
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++
++namespace TFE_Coop
++{
++namespace Protocol
++{
++	static constexpr std::uint32_t Magic = 0x54464350u; // "TFCP"
++	static constexpr std::uint16_t Version = 1;
++	static constexpr std::size_t MaxPacketSize = 512;
++	static constexpr std::size_t HeaderSize = 20;
++	static constexpr std::size_t MaxPlayerName = 31;
++
++	enum class PacketType : std::uint8_t
++	{
++		Invalid = 0,
++		Hello = 1,
++		Welcome = 2,
++		PlayerState = 3,
++		ProjectileEvent = 4,
++		UseEvent = 5,
++		Ack = 6,
++		Ping = 7,
++		Pong = 8,
++		Disconnect = 9,
++	};
++
++	enum PlayerFlags : std::uint8_t
++	{
++		PlayerFlagNone = 0,
++		PlayerFlagMoving = 1u << 0,
++		PlayerFlagCrouching = 1u << 1,
++		PlayerFlagDying = 1u << 2,
++		PlayerFlagPrimaryFire = 1u << 3,
++		PlayerFlagSecondaryFire = 1u << 4,
++	};
++
++	struct Datagram
++	{
++		std::array<std::uint8_t, MaxPacketSize> bytes = {};
++		std::size_t size = 0;
++	};
++
++	struct Header
++	{
++		PacketType type = PacketType::Invalid;
++		std::uint8_t flags = 0;
++		std::uint32_t sessionId = 0;
++		std::uint32_t sequence = 0;
++		std::uint16_t payloadSize = 0;

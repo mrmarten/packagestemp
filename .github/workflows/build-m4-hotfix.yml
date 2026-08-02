@@ -1,0 +1,32 @@
+name: Build TFE Co-op M4 hotfix
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat patches/m4-hotfix/part-*.txt > hotfix.patch.xz.b64
+          base64 --decode hotfix.patch.xz.b64 > hotfix.patch.xz
+          xz --decompress --stdout hotfix.patch.xz > hotfix.patch
+          sha256sum hotfix.patch hotfix.patch.xz hotfix.patch.xz.b64 | tee HOTFIX-SHA256.txt
+          sed -n '1,80p' hotfix.patch
+          grep -n -E 'agentMenu_resetState|DARKPILO|ensure.*Agent|agentMenuFrames' hotfix.patch | head -100 || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: decoded-hotfix-patch
+          path: |
+            hotfix.patch
+            HOTFIX-SHA256.txt
+          if-no-files-found: error
+          retention-days: 7

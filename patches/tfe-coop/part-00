@@ -1,0 +1,142 @@
+From 1e7692cb5d75e6e8a827cff08582d27a39a5e4c5 Mon Sep 17 00:00:00 2001
+From: OpenAI Build <build@openai.local>
+Date: Sun, 2 Aug 2026 09:57:35 +0000
+Subject: [PATCH] Add experimental two-player Dark Forces co-op prototype
+
+---
+ COOP_README.md                                | 143 ++++
+ CoopLaunchers/Host-Coop.bat                   |  15 +
+ CoopLaunchers/Join-Coop.bat                   |  21 +
+ TheForceEngine/TFE_DarkForces/Coop/coop.cpp   | 455 +++++++++++++
+ TheForceEngine/TFE_DarkForces/Coop/coop.h     |  36 +
+ .../TFE_DarkForces/Coop/coopProtocol.cpp      | 294 ++++++++
+ .../TFE_DarkForces/Coop/coopProtocol.h        | 158 +++++
+ .../TFE_DarkForces/Coop/coopSession.cpp       | 643 ++++++++++++++++++
+ .../TFE_DarkForces/Coop/coopSession.h         | 158 +++++
+ .../TFE_DarkForces/Coop/coopTransport.cpp     | 231 +++++++
+ .../TFE_DarkForces/Coop/coopTransport.h       |  42 ++
+ .../TFE_DarkForces/darkForcesMain.cpp         |   2 +
+ TheForceEngine/TFE_DarkForces/mission.cpp     |   7 +
+ TheForceEngine/TFE_DarkForces/player.cpp      |  30 +-
+ TheForceEngine/TFE_DarkForces/player.h        |   1 +
+ TheForceEngine/TFE_DarkForces/projectile.cpp  |   2 +
+ TheForceEngine/TFE_DarkForces/projectile.h    |   1 +
+ TheForceEngine/TheForceEngine.vcxproj         |   8 +
+ TheForceEngine/TheForceEngine.vcxproj.filters |  24 +
+ TheForceEngine/main.cpp                       |  40 ++
+ tests/coop/build_and_run.sh                   |  48 ++
+ tests/coop/coopProtocolTest.cpp               | 171 +++++
+ tests/coop/coopSessionTest.cpp                | 134 ++++
+ 23 files changed, 2654 insertions(+), 10 deletions(-)
+ create mode 100644 COOP_README.md
+ create mode 100644 CoopLaunchers/Host-Coop.bat
+ create mode 100644 CoopLaunchers/Join-Coop.bat
+ create mode 100644 TheForceEngine/TFE_DarkForces/Coop/coop.cpp
+ create mode 100644 TheForceEngine/TFE_DarkForces/Coop/coop.h
+ create mode 100644 TheForceEngine/TFE_DarkForces/Coop/coopProtocol.cpp
+ create mode 100644 TheForceEngine/TFE_DarkForces/Coop/coopProtocol.h
+ create mode 100644 TheForceEngine/TFE_DarkForces/Coop/coopSession.cpp
+ create mode 100644 TheForceEngine/TFE_DarkForces/Coop/coopSession.h
+ create mode 100644 TheForceEngine/TFE_DarkForces/Coop/coopTransport.cpp
+ create mode 100644 TheForceEngine/TFE_DarkForces/Coop/coopTransport.h
+ create mode 100755 tests/coop/build_and_run.sh
+ create mode 100644 tests/coop/coopProtocolTest.cpp
+ create mode 100644 tests/coop/coopSessionTest.cpp
+
+diff --git a/COOP_README.md b/COOP_README.md
+new file mode 100644
+index 0000000..1cf5a66
+--- /dev/null
++++ b/COOP_README.md
+@@ -0,0 +1,143 @@
++# The Force Engine co-op prototype
++
++This branch adds an experimental two-player network co-op vertical slice to **The Force Engine** for the 1995 release of *Star Wars: Dark Forces*.
++
++It is an engine fork, not a normal GOB/ZIP content mod. Both players must own the game and point The Force Engine at their own installed game data. No LucasArts/Disney/GOG game files are included.
++
++## What is implemented
++
++- One host and one client over IPv4 UDP.
++- LAN or direct-IP connection on UDP port `27500` by default.
++- Build/content compatibility handshake before a client is accepted.
++- 30 Hz replication of player position, sector, view direction, weapon, health, shields, and mission-goal masks.
++- A visible remote-player ghost in the current level.
++- Reliable, acknowledged replication of player-fired projectiles.
++- Reliable, acknowledged replication of the `Use` action for doors, switches, elevators, and INF triggers.
++- Host-owned trigger/item objective masks.
++- Ping/RTT statistics, retransmission, duplicate suppression, disconnect handling, and peer timeout handling.
++- Cross-platform socket implementation for Windows and POSIX systems.
++- Standalone protocol and loopback integration tests.
++
++## Important scope limits
++
++This is a **first playable networking prototype**, not yet a campaign-complete co-op release.
++
++The following systems still require deeper engine work before all fourteen missions can be completed reliably together:
++
++- Enemy AI and enemy health/state are still simulated independently on each machine.
++- Pickups, inventory, keys, ammo, boss state, generators, scripted actors, moving geometry, and arbitrary INF state are not generally host-authoritative.
++- Level selection, briefing/cutscene playback, mission completion, and level transitions are not automatically coordinated.
++- Both players must manually start the same mission with matching data and gameplay settings.
++- Join-in-progress, co-op save files, reconnect/resume, NAT traversal, relay servers, matchmaking, anti-cheat, and native split-screen are not implemented.
++- Mods are not included in the compatibility hash yet. Test with the unmodified campaign and matching TFE settings.
++- The remote player is deliberately non-colliding and is not yet a true second `PlayerContext`; enemies do not consistently target it.
++
++These limitations are documented explicitly so this build is not mistaken for the completed campaign project.
++
++## Windows usage
++
++Place the co-op build in a normal The Force Engine folder and configure the Dark Forces source-data path as usual.
++
++Host:
++
++```bat
++theforceengine.exe --game DARK --coop-host 27500 --coop-name Host --coop-debug
++```
++
++Client on the same LAN:
++
++```bat
++theforceengine.exe --game DARK --coop-connect 192.168.1.20 27500 --coop-name Client --coop-debug
++```
++
++Replace `192.168.1.20` with the host computer's IPv4 address. Permit `theforceengine.exe` through Windows Defender Firewall for private networks. For play across the internet, forward UDP port `27500` to the host or use a trusted private-network/VPN solution. Automatic NAT traversal is not present.
++
++The included `Host-Coop.bat` and `Join-Coop.bat` launchers provide the same commands interactively.
++
++## Test procedure
++
++1. Use the same co-op executable on both computers.
++2. Use matching original game data and disable other mods.
++3. Start the host and client commands.
++4. Wait for `Connection state: connected` in `the_force_engine_log.txt`.
++5. On both installations, start the same mission and difficulty.
++6. Confirm that the remote stormtrooper-shaped ghost moves.
++7. Test primary/secondary fire and several doors, switches, and elevators.
++8. Keep `--coop-debug` enabled while reporting problems; it logs RTT, packet counts, retries, and pending reliable events.
++
++A mismatch is rejected before connection with:
++
++```text
++Co-op content/build hash differs from the host
++```
++
++## Standalone tests
++
++On Linux or another POSIX development environment:
++
++```bash
++./tests/coop/build_and_run.sh
++```
++
++The script compiles with warnings treated as errors and runs:
++
++- packet serialization/validation tests;
++- host/client loopback handshake;
++- bidirectional player-state replication;
++- reliable projectile and use events;
++- ACK removal;
++- disconnect recovery;
++- mismatched-content rejection.
++

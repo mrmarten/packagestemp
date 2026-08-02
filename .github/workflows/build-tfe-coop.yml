@@ -9,7 +9,7 @@ permissions:
 
 env:
   TFE_SHA: 54eab324e9b265c503b51c3690f030f42a0f9fcc
-  PATCH_SHA256: 1d918f70e505819f5e254b80aaa5c6228c4ea530844828035fd4e938f90122dd
+  PATCH_SHA256: 3721f2a2c97a18686ac72efc7f16dc9edd7c5a0bbdcab99da1eb86cd5243ca27
 
 jobs:
   linux:
@@ -88,11 +88,13 @@ jobs:
         shell: pwsh
         run: |
           $parts = Get-ChildItem patches/tfe-coop/part-* | Sort-Object Name
-          $output = [System.IO.File]::Create("tfe-coop.patch")
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          $output = New-Object System.IO.StreamWriter('tfe-coop.patch', $false, $utf8NoBom)
           try {
             foreach ($part in $parts) {
-              $bytes = [System.IO.File]::ReadAllBytes($part.FullName)
-              $output.Write($bytes, 0, $bytes.Length)
+              $text = [System.IO.File]::ReadAllText($part.FullName)
+              $text = $text.Replace("`r`n", "`n")
+              $output.Write($text)
             }
           } finally {
             $output.Dispose()

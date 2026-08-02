@@ -9,7 +9,7 @@ permissions:
 
 env:
   TFE_SHA: 54eab324e9b265c503b51c3690f030f42a0f9fcc
-  PATCH_SHA256: f9903b5a6e8df39b957f15171e548cfb157781bafc4fa2de68451875f32f75e4
+  PATCH_SHA256: 1d918f70e505819f5e254b80aaa5c6228c4ea530844828035fd4e938f90122dd
 
 jobs:
   linux:
@@ -23,6 +23,7 @@ jobs:
         run: |
           cat patches/tfe-coop/part-* > tfe-coop.patch
           actual="$(sha256sum tfe-coop.patch | awk '{print $1}')"
+          echo "Reconstructed patch SHA-256: $actual"
           test "$actual" = "$PATCH_SHA256"
           git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
           git -C tfe checkout "$TFE_SHA"
@@ -58,7 +59,7 @@ jobs:
           cp tfe/COOP_README.md tfe/LICENSE package-linux/
           tar -C package-linux -czf TFE-Coop-Prototype-linux-x64.tar.gz .
           git -C tfe archive --format=zip --prefix=TheForceEngine-Coop-Prototype-source/ HEAD > TFE-Coop-Prototype-source.zip
-          sha256sum TFE-Coop-Prototype-linux-x64.tar.gz TFE-Coop-Prototype-source.zip > SHA256SUMS-linux.txt
+          sha256sum TFE-Coop-Prototype-linux-x64.tar.gz TFE-Coop-Prototype-source.zip tfe-coop.patch > SHA256SUMS-linux.txt
 
       - uses: actions/upload-artifact@v4
         with:
@@ -71,7 +72,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: TFE-Coop-Prototype-source
-          path: TFE-Coop-Prototype-source.zip
+          path: |
+            TFE-Coop-Prototype-source.zip
+            tfe-coop.patch
           if-no-files-found: error
 
   windows:
@@ -95,6 +98,7 @@ jobs:
             $output.Dispose()
           }
           $actual = (Get-FileHash tfe-coop.patch -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "Reconstructed patch SHA-256: $actual"
           if ($actual -ne $env:PATCH_SHA256) { throw "Patch checksum mismatch: $actual" }
           git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
           git -C tfe checkout $env:TFE_SHA

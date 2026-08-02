@@ -1,0 +1,149 @@
+name: Build TFE co-op prototype
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TFE_SHA: 54eab324e9b265c503b51c3690f030f42a0f9fcc
+  PATCH_SHA256: f9903b5a6e8df39b957f15171e548cfb157781bafc4fa2de68451875f32f75e4
+
+jobs:
+  linux:
+    name: Linux build and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct and apply exact patch
+        shell: bash
+        run: |
+          cat patches/tfe-coop/part-* > tfe-coop.patch
+          actual="$(sha256sum tfe-coop.patch | awk '{print $1}')"
+          test "$actual" = "$PATCH_SHA256"
+          git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
+          git -C tfe checkout "$TFE_SHA"
+          git -C tfe am "$GITHUB_WORKSPACE/tfe-coop.patch"
+
+      - name: Run networking tests
+        shell: bash
+        run: |
+          tfe/tests/coop/build_and_run.sh
+          COOP_TEST_BUILD_DIR="$PWD/tfe/build/coop-tests-sanitized" COOP_SANITIZE=1 tfe/tests/coop/build_and_run.sh
+
+      - name: Install Linux dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev libsdl2-image-dev
+
+      - name: Configure and build Linux x64
+        shell: bash
+        run: |
+          cmake -S tfe -B build-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_SYSMIDI=OFF \
+            -DENABLE_EDITOR=OFF \
+            -DENABLE_OGV_CUTSCENES=OFF
+          cmake --build build-linux --parallel 2
+
+      - name: Package Linux binary and source
+        shell: bash
+        run: |
+          rm -rf package-linux
+          cmake --install build-linux --prefix "$PWD/package-linux"
+          cp tfe/COOP_README.md tfe/LICENSE package-linux/
+          tar -C package-linux -czf TFE-Coop-Prototype-linux-x64.tar.gz .
+          git -C tfe archive --format=zip --prefix=TheForceEngine-Coop-Prototype-source/ HEAD > TFE-Coop-Prototype-source.zip
+          sha256sum TFE-Coop-Prototype-linux-x64.tar.gz TFE-Coop-Prototype-source.zip > SHA256SUMS-linux.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Prototype-linux-x64
+          path: |
+            TFE-Coop-Prototype-linux-x64.tar.gz
+            SHA256SUMS-linux.txt
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Prototype-source
+          path: TFE-Coop-Prototype-source.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64 build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Reconstruct and apply exact patch
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem patches/tfe-coop/part-* | Sort-Object Name
+          $output = [System.IO.File]::Create("tfe-coop.patch")
+          try {
+            foreach ($part in $parts) {
+              $bytes = [System.IO.File]::ReadAllBytes($part.FullName)
+              $output.Write($bytes, 0, $bytes.Length)
+            }
+          } finally {
+            $output.Dispose()
+          }
+          $actual = (Get-FileHash tfe-coop.patch -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:PATCH_SHA256) { throw "Patch checksum mismatch: $actual" }
+          git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
+          git -C tfe checkout $env:TFE_SHA
+          git -C tfe am (Resolve-Path tfe-coop.patch)
+
+      - name: Build Windows x64
+        shell: pwsh
+        run: |
+          msbuild tfe\TheForceEngine.sln /m /restore `
+            /p:Configuration=BuildForRelease `
+            /p:Platform=x64 `
+            /p:PlatformToolset=v143 `
+            /p:WindowsTargetPlatformVersion=10.0
+
+      - name: Package Windows x64
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path tfe -Recurse -Filter *.exe |
+            Where-Object { $_.Name -match 'TheForceEngine|theforceengine' -and $_.FullName -match 'BuildForRelease|Release' } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+          if (-not $exe) { throw "The Force Engine executable was not found after MSBuild." }
+
+          New-Item -ItemType Directory -Force package-windows | Out-Null
+          Copy-Item $exe.FullName package-windows\theforceengine.exe
+
+          $dlls = @('SDL2.dll','SDL2_image.dll','ogg.dll','theora.dll','vorbis.dll')
+          foreach ($dll in $dlls) {
+            $path = Join-Path 'tfe\TheForceEngine' $dll
+            if (-not (Test-Path $path)) { throw "Required runtime DLL missing: $dll" }
+            Copy-Item $path package-windows
+          }
+
+          $support = @('Captions','Documentation','ExternalData','Fonts','Mods','Shaders','SoundFonts','UI_Images','UI_Text','EditorDef','Tests')
+          foreach ($dir in $support) {
+            $path = Join-Path 'tfe\TheForceEngine' $dir
+            if (Test-Path $path) { Copy-Item $path package-windows -Recurse }
+          }
+
+          Copy-Item tfe\COOP_README.md,tfe\LICENSE package-windows
+          Copy-Item tfe\CoopLaunchers\*.bat package-windows
+          Compress-Archive -Path package-windows\* -DestinationPath TFE-Coop-Prototype-windows-x64.zip -CompressionLevel Optimal
+          $hash = (Get-FileHash TFE-Coop-Prototype-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  TFE-Coop-Prototype-windows-x64.zip" | Set-Content SHA256SUMS-windows.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Prototype-windows-x64
+          path: |
+            TFE-Coop-Prototype-windows-x64.zip
+            SHA256SUMS-windows.txt
+          if-no-files-found: error

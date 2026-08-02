@@ -1,0 +1,206 @@
++Set `COOP_SANITIZE=1` to build with AddressSanitizer and UndefinedBehaviorSanitizer:
++
++```bash
++COOP_SANITIZE=1 ./tests/coop/build_and_run.sh
++```
++
++## Protocol overview
++
++Each datagram uses a fixed 20-byte header with:
++
++- magic `TFCP`;
++- protocol version;
++- packet type and flags;
++- session ID;
++- sequence number;
++- payload length.
++
++Multi-byte fields are serialized explicitly in network byte order. Player snapshots are sequenced and sent unreliably. Gameplay actions that must not disappear use event IDs, ACKs, retransmission, and duplicate suppression.
++
++The handshake compares a 32-bit FNV-1a compatibility hash derived from the TFE build identifier, co-op protocol version, and sampled content from the core Dark Forces GOB archives.
++
++## Source layout
++
++```text
++TheForceEngine/TFE_DarkForces/Coop/
++  coop.cpp             Dark Forces integration and remote ghost
++  coop.h               engine-facing API
++  coopProtocol.*       wire protocol and serialization
++  coopSession.*        handshake, state transfer, reliability, timeout
++  coopTransport.*      Windows/POSIX nonblocking UDP transport
++
++tests/coop/
++  coopProtocolTest.cpp
++  coopSessionTest.cpp
++  build_and_run.sh
++```
++
++## Next engineering milestones
++
++The next milestone should replace independent world simulation with a host-authoritative entity protocol:
++
++1. Stable network IDs for actors, projectiles, pickups, movers, and scripted objects.
++2. Host-owned enemy targeting, health, death, and spawn state.
++3. Reliable pickup/inventory/key transactions.
++4. INF/mover state snapshots and periodic world checksums.
++5. Coordinated mission start, cutscenes, completion, and level transition.
++6. Per-player health, death, revive, HUD, and save serialization.
++7. Two-instance local split-screen launcher, followed later by native dual-camera split-screen.
++
++## Licensing
++
++The Force Engine source is GPL-2.0. A distributed modified executable must be accompanied by the corresponding modified source under the applicable GPL terms. Original game archives must not be redistributed.
+diff --git a/CoopLaunchers/Host-Coop.bat b/CoopLaunchers/Host-Coop.bat
+new file mode 100644
+index 0000000..9ea3fde
+--- /dev/null
++++ b/CoopLaunchers/Host-Coop.bat
+@@ -0,0 +1,15 @@
++@echo off
++setlocal
++cd /d "%~dp0"
++set "TFE_EXE=%~dp0theforceengine.exe"
++if not exist "%TFE_EXE%" set "TFE_EXE=%~dp0..\theforceengine.exe"
++if not exist "%TFE_EXE%" (
++  echo ERROR: theforceengine.exe was not found next to this launcher.
++  pause
++  exit /b 1
++)
++set "COOP_PORT=27500"
++set /p COOP_NAME=Host player name [Host]:
++if not defined COOP_NAME set "COOP_NAME=Host"
++"%TFE_EXE%" --game DARK --coop-host %COOP_PORT% --coop-name "%COOP_NAME%" --coop-debug
++endlocal
+diff --git a/CoopLaunchers/Join-Coop.bat b/CoopLaunchers/Join-Coop.bat
+new file mode 100644
+index 0000000..a78e775
+--- /dev/null
++++ b/CoopLaunchers/Join-Coop.bat
+@@ -0,0 +1,21 @@
++@echo off
++setlocal
++cd /d "%~dp0"
++set "TFE_EXE=%~dp0theforceengine.exe"
++if not exist "%TFE_EXE%" set "TFE_EXE=%~dp0..\theforceengine.exe"
++if not exist "%TFE_EXE%" (
++  echo ERROR: theforceengine.exe was not found next to this launcher.
++  pause
++  exit /b 1
++)
++set /p COOP_HOST=Host IPv4 address:
++if not defined COOP_HOST (
++  echo ERROR: A host address is required.
++  pause
++  exit /b 1
++)
++set "COOP_PORT=27500"
++set /p COOP_NAME=Client player name [Client]:
++if not defined COOP_NAME set "COOP_NAME=Client"
++"%TFE_EXE%" --game DARK --coop-connect "%COOP_HOST%" %COOP_PORT% --coop-name "%COOP_NAME%" --coop-debug
++endlocal
+diff --git a/TheForceEngine/TFE_DarkForces/Coop/coop.cpp b/TheForceEngine/TFE_DarkForces/Coop/coop.cpp
+new file mode 100644
+index 0000000..1e2a803
+--- /dev/null
++++ b/TheForceEngine/TFE_DarkForces/Coop/coop.cpp
+@@ -0,0 +1,455 @@
++#include "coop.h"
++#include "coopSession.h"
++
++#include <TFE_Asset/spriteAsset_Jedi.h>
++#include <TFE_DarkForces/agent.h>
++#include <TFE_DarkForces/player.h>
++#include <TFE_DarkForces/playerLogic.h>
++#include <TFE_DarkForces/projectile.h>
++#include <TFE_DarkForces/time.h>
++#include <TFE_ExternalData/customProjectile.h>
++#include <TFE_FileSystem/filestream.h>
++#include <TFE_FileSystem/paths.h>
++#include <TFE_Jedi/Level/levelData.h>
++#include <TFE_Jedi/Level/robject.h>
++#include <TFE_Jedi/Level/rsector.h>
++#include <TFE_Jedi/Math/core_math.h>
++#include <TFE_System/system.h>
++
++#include <algorithm>
++#include <array>
++#include <cctype>
++#include <cinttypes>
++#include <cstring>
++#include <string>
++
++using namespace TFE_DarkForces;
++using namespace TFE_Jedi;
++
++namespace TFE_Coop
++{
++	namespace
++	{
++		static constexpr std::uint16_t DefaultPort = 27500;
++		static constexpr std::uint8_t ProjectileFlagExplodes = 1u << 0;
++		static constexpr std::uint8_t ProjectileFlagNoScale = 1u << 1;
++
++		SessionConfig s_config;
++		Session s_session;
++		bool s_configured = false;
++		bool s_started = false;
++		bool s_debugLogging = false;
++		bool s_missionActive = false;
++		std::uint32_t s_levelHash = 0;
++		SecObject* s_remotePlayer = nullptr;
++		Protocol::PlayerState s_remoteTarget;
++		bool s_haveRemoteTarget = false;
++		ConnectionState s_lastConnectionState = ConnectionState::Stopped;
++
++		std::uint32_t fnv1a(const void* data, std::size_t size, std::uint32_t hash = 2166136261u)
++		{
++			const std::uint8_t* bytes = static_cast<const std::uint8_t*>(data);
++			for (std::size_t i = 0; i < size; i++)
++			{
++				hash ^= bytes[i];
++				hash *= 16777619u;
++			}
++			return hash;
++		}
++
++		std::uint32_t hashStringCaseInsensitive(const char* text, std::uint32_t hash = 2166136261u)
++		{
++			if (!text) { return hash; }
++			while (*text)
++			{
++				const unsigned char value = static_cast<unsigned char>(std::toupper(static_cast<unsigned char>(*text++)));
++				hash = fnv1a(&value, 1, hash);
++			}
++			return hash;
++		}
++
++		bool openSourceFile(const char* name, FileStream& stream)
++		{
++			char path[TFE_MAX_PATH];
++			TFE_Paths::appendPath(PATH_SOURCE_DATA, name, path);
++			if (stream.open(path, Stream::MODE_READ)) { return true; }
++
++			std::string lower(name ? name : "");
++			std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char value) {
++				return static_cast<char>(std::tolower(value));
++			});
++			TFE_Paths::appendPath(PATH_SOURCE_DATA, lower.c_str(), path);
++			return stream.open(path, Stream::MODE_READ);
++		}
++
++		std::uint32_t hashFileSample(const char* name, std::uint32_t hash)
++		{
++			hash = hashStringCaseInsensitive(name, hash);
++			FileStream stream;
++			if (!openSourceFile(name, stream))
++			{
++				const std::uint32_t missing = 0xffffffffu;
++				return fnv1a(&missing, sizeof(missing), hash);
++			}
++
++			const std::uint64_t size = static_cast<std::uint64_t>(stream.getSize());
++			hash = fnv1a(&size, sizeof(size), hash);
++			std::array<std::uint8_t, 65536> buffer = {};
++			const std::uint32_t firstSize = static_cast<std::uint32_t>(std::min<std::uint64_t>(buffer.size(), size));
++			if (firstSize)
++			{

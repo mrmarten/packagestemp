@@ -1,0 +1,26 @@
+name: Fetch The Force Engine source
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone upstream source
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/TheForceEngine/TheForceEngine.git tfe-source
+          git -C tfe-source rev-parse HEAD > tfe-source/UPSTREAM_COMMIT.txt
+          rm -rf tfe-source/.git
+      - name: Upload source tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfe-source
+          path: tfe-source
+          if-no-files-found: error
+          retention-days: 1

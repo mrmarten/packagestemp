@@ -1,4 +1,4 @@
-name: Build TFE co-op prototype
+name: Build TFE Co-op Milestone 2
 
 on:
   pull_request:
@@ -9,35 +9,132 @@ permissions:
 
 env:
   TFE_SHA: 54eab324e9b265c503b51c3690f030f42a0f9fcc
-  PATCH_SHA256: f9903b5a6e8df39b957f15171e548cfb157781bafc4fa2de68451875f32f75e4
+  PHASE1_PATCH_SHA256: f9903b5a6e8df39b957f15171e548cfb157781bafc4fa2de68451875f32f75e4
+  MILESTONE2_B64_SHA256: f9c0d01ac942729748e0382f747ebc05f93234f733432dc083b0ac27a33c0513
+  MILESTONE2_XZ_SHA256: 7225767760b09a417152d7d642044afda4ad3c7b4c6ec4b4f32863e41513a7b9
+  MILESTONE2_DIFF_SHA256: 9aa64c476b0be5ca72f9e7fdfdea6c9422002723659288275a89629352a9fb82
+  MILESTONE2_TREE_SHA: f78c62c7daa940405513d2d6e0bbc136f4f392d2
 
 jobs:
-  linux:
-    name: Linux build and tests
+  prepare:
+    name: Verify and prepare exact source tree
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Reconstruct and apply exact patch
+      - name: Reconstruct checksum-pinned patches
         shell: bash
         run: |
-          : > tfe-coop.patch
-          for part in $(find patches/tfe-coop -maxdepth 1 -type f -name 'part-*' | sort); do
-            cat "$part" >> tfe-coop.patch
-            if [ -n "$(tail -c 1 "$part")" ]; then printf '\n' >> tfe-coop.patch; fi
-          done
-          actual="$(sha256sum tfe-coop.patch | awk '{print $1}')"
-          echo "Reconstructed patch SHA-256: $actual"
-          test "$actual" = "$PATCH_SHA256"
+          set -euo pipefail
+
+          : > phase1.patch
+          while IFS= read -r part; do
+            cat "$part" >> phase1.patch
+            if [ -n "$(tail -c 1 "$part")" ]; then printf '\n' >> phase1.patch; fi
+          done < <(find patches/tfe-coop -maxdepth 1 -type f -name 'part-*' | sort)
+          echo "$(sha256sum phase1.patch | awk '{print $1}')  phase1.patch"
+          test "$(sha256sum phase1.patch | awk '{print $1}')" = "$PHASE1_PATCH_SHA256"
+
+          cat $(find patches/tfe-coop-m2-b64 -maxdepth 1 -type f -name 'part-*.txt' | sort) > milestone2.diff.xz.b64
+          echo "$(sha256sum milestone2.diff.xz.b64 | awk '{print $1}')  milestone2.diff.xz.b64"
+          test "$(sha256sum milestone2.diff.xz.b64 | awk '{print $1}')" = "$MILESTONE2_B64_SHA256"
+
+          base64 --decode milestone2.diff.xz.b64 > milestone2.diff.xz
+          echo "$(sha256sum milestone2.diff.xz | awk '{print $1}')  milestone2.diff.xz"
+          test "$(sha256sum milestone2.diff.xz | awk '{print $1}')" = "$MILESTONE2_XZ_SHA256"
+
+          xz --decompress --stdout milestone2.diff.xz > milestone2.diff
+          echo "$(sha256sum milestone2.diff | awk '{print $1}')  milestone2.diff"
+          test "$(sha256sum milestone2.diff | awk '{print $1}')" = "$MILESTONE2_DIFF_SHA256"
+
+      - name: Apply patches and verify resulting Git tree
+        shell: bash
+        run: |
+          set -euo pipefail
           git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
           git -C tfe checkout "$TFE_SHA"
-          git -C tfe config user.name "OpenAI CI Build"
-          git -C tfe config user.email "build@openai.local"
-          git -C tfe am "$GITHUB_WORKSPACE/tfe-coop.patch"
+          git -C tfe config user.name "TFE Co-op Build"
+          git -C tfe config user.email "build@tfe-coop.invalid"
 
-      - name: Run networking tests
+          git -C tfe am "$GITHUB_WORKSPACE/phase1.patch"
+          git -C tfe apply --check "$GITHUB_WORKSPACE/milestone2.diff"
+          git -C tfe apply --index "$GITHUB_WORKSPACE/milestone2.diff"
+          GIT_AUTHOR_DATE="2026-08-02T00:00:00Z" \
+          GIT_COMMITTER_DATE="2026-08-02T00:00:00Z" \
+            git -C tfe commit -m "Add host-authoritative co-op world synchronization"
+
+          actual_tree="$(git -C tfe rev-parse HEAD^{tree})"
+          echo "Prepared tree: $actual_tree"
+          test "$actual_tree" = "$MILESTONE2_TREE_SHA"
+          git -C tfe diff --check "$TFE_SHA"..HEAD
+
+      - name: Create reproducible source, patch and build bundle
         shell: bash
         run: |
+          set -euo pipefail
+
+          git -C tfe format-patch --stdout "$TFE_SHA"..HEAD > TheForceEngine-Coop-Milestone-2.patch
+          git -C tfe archive --format=zip --prefix=TheForceEngine-Coop-Milestone-2-source/ HEAD > TFE-Coop-Milestone-2-source.zip
+
+          rm -rf build-export
+          mkdir build-export
+          git -C tfe archive HEAD | tar -x -C build-export
+          git -C build-export init -b milestone2
+          git -C build-export config user.name "TFE Co-op Build"
+          git -C build-export config user.email "build@tfe-coop.invalid"
+          git -C build-export add -A
+          GIT_AUTHOR_DATE="2026-08-02T00:00:00Z" \
+          GIT_COMMITTER_DATE="2026-08-02T00:00:00Z" \
+            git -C build-export commit -m "TFE Co-op Milestone 2 verified source"
+          git -C build-export tag tfe-coop-milestone-2
+          test "$(git -C build-export rev-parse HEAD^{tree})" = "$MILESTONE2_TREE_SHA"
+          git -C build-export bundle create "$GITHUB_WORKSPACE/TFE-Coop-Milestone-2-build.bundle" --all
+
+          {
+            echo "The Force Engine Co-op Milestone 2 build manifest"
+            echo "Upstream commit: $TFE_SHA"
+            echo "Verified source tree: $MILESTONE2_TREE_SHA"
+            echo "Phase 1 patch SHA-256: $PHASE1_PATCH_SHA256"
+            echo "Milestone 2 diff SHA-256: $MILESTONE2_DIFF_SHA256"
+            sha256sum TheForceEngine-Coop-Milestone-2.patch
+            sha256sum TFE-Coop-Milestone-2-source.zip
+            sha256sum TFE-Coop-Milestone-2-build.bundle
+          } > BUILD-MANIFEST.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-2-build-source
+          path: TFE-Coop-Milestone-2-build.bundle
+          if-no-files-found: error
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-2-source
+          path: |
+            TFE-Coop-Milestone-2-source.zip
+            TheForceEngine-Coop-Milestone-2.patch
+            BUILD-MANIFEST.txt
+          if-no-files-found: error
+
+  linux:
+    name: Linux x64 build and tests
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-2-build-source
+          path: prepared
+
+      - name: Restore verified source
+        shell: bash
+        run: git clone prepared/TFE-Coop-Milestone-2-build.bundle tfe
+
+      - name: Run protocol, session and sanitizer tests
+        shell: bash
+        run: |
+          set -euo pipefail
           tfe/tests/coop/build_and_run.sh
           COOP_TEST_BUILD_DIR="$PWD/tfe/build/coop-tests-sanitized" COOP_SANITIZE=1 tfe/tests/coop/build_and_run.sh
 
@@ -50,6 +147,7 @@ jobs:
       - name: Configure and build Linux x64
         shell: bash
         run: |
+          set -euo pipefail
           cmake -S tfe -B build-linux -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_SYSMIDI=OFF \
@@ -57,63 +155,38 @@ jobs:
             -DENABLE_OGV_CUTSCENES=OFF
           cmake --build build-linux --parallel 2
 
-      - name: Package Linux binary and source
+      - name: Package Linux x64
         shell: bash
         run: |
+          set -euo pipefail
           rm -rf package-linux
           cmake --install build-linux --prefix "$PWD/package-linux"
           cp tfe/COOP_README.md tfe/LICENSE package-linux/
-          tar -C package-linux -czf TFE-Coop-Prototype-linux-x64.tar.gz .
-          git -C tfe archive --format=zip --prefix=TheForceEngine-Coop-Prototype-source/ HEAD > TFE-Coop-Prototype-source.zip
-          sha256sum TFE-Coop-Prototype-linux-x64.tar.gz TFE-Coop-Prototype-source.zip tfe-coop.patch > SHA256SUMS-linux.txt
+          tar -C package-linux -czf TFE-Coop-Milestone-2-linux-x64.tar.gz .
+          sha256sum TFE-Coop-Milestone-2-linux-x64.tar.gz > SHA256SUMS-linux.txt
 
       - uses: actions/upload-artifact@v4
         with:
-          name: TFE-Coop-Prototype-linux-x64
+          name: TFE-Coop-Milestone-2-linux-x64
           path: |
-            TFE-Coop-Prototype-linux-x64.tar.gz
+            TFE-Coop-Milestone-2-linux-x64.tar.gz
             SHA256SUMS-linux.txt
-          if-no-files-found: error
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: TFE-Coop-Prototype-source
-          path: |
-            TFE-Coop-Prototype-source.zip
-            tfe-coop.patch
           if-no-files-found: error
 
   windows:
     name: Windows x64 build
+    needs: prepare
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-2-build-source
+          path: prepared
       - uses: microsoft/setup-msbuild@v2
 
-      - name: Reconstruct and apply exact patch
+      - name: Restore verified source
         shell: pwsh
-        run: |
-          $parts = Get-ChildItem patches/tfe-coop/part-* | Sort-Object Name
-          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-          $output = New-Object System.IO.StreamWriter('tfe-coop.patch', $false, $utf8NoBom)
-          try {
-            foreach ($part in $parts) {
-              $text = [System.IO.File]::ReadAllText($part.FullName)
-              $text = $text.Replace("`r`n", "`n")
-              $output.Write($text)
-              if (-not $text.EndsWith("`n")) { $output.Write("`n") }
-            }
-          } finally {
-            $output.Dispose()
-          }
-          $actual = (Get-FileHash tfe-coop.patch -Algorithm SHA256).Hash.ToLowerInvariant()
-          Write-Host "Reconstructed patch SHA-256: $actual"
-          if ($actual -ne $env:PATCH_SHA256) { throw "Patch checksum mismatch: $actual" }
-          git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
-          git -C tfe checkout $env:TFE_SHA
-          git -C tfe config user.name "OpenAI CI Build"
-          git -C tfe config user.email "build@openai.local"
-          git -C tfe am (Resolve-Path tfe-coop.patch)
+        run: git clone prepared\TFE-Coop-Milestone-2-build.bundle tfe
 
       - name: Build Windows x64
         shell: pwsh
@@ -151,14 +224,14 @@ jobs:
 
           Copy-Item tfe\COOP_README.md,tfe\LICENSE package-windows
           Copy-Item tfe\CoopLaunchers\*.bat package-windows
-          Compress-Archive -Path package-windows\* -DestinationPath TFE-Coop-Prototype-windows-x64.zip -CompressionLevel Optimal
-          $hash = (Get-FileHash TFE-Coop-Prototype-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  TFE-Coop-Prototype-windows-x64.zip" | Set-Content SHA256SUMS-windows.txt
+          Compress-Archive -Path package-windows\* -DestinationPath TFE-Coop-Milestone-2-windows-x64.zip -CompressionLevel Optimal
+          $hash = (Get-FileHash TFE-Coop-Milestone-2-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  TFE-Coop-Milestone-2-windows-x64.zip" | Set-Content SHA256SUMS-windows.txt
 
       - uses: actions/upload-artifact@v4
         with:
-          name: TFE-Coop-Prototype-windows-x64
+          name: TFE-Coop-Milestone-2-windows-x64
           path: |
-            TFE-Coop-Prototype-windows-x64.zip
+            TFE-Coop-Milestone-2-windows-x64.zip
             SHA256SUMS-windows.txt
           if-no-files-found: error

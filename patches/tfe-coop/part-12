@@ -1,0 +1,176 @@
++		TFE_Coop::notifyLocalUse(s_playerObject);
+ 	}
+ 				
+ 	void handlePlayerActions()
+diff --git a/TheForceEngine/TFE_DarkForces/player.h b/TheForceEngine/TFE_DarkForces/player.h
+index e46b119..7251494 100644
+--- a/TheForceEngine/TFE_DarkForces/player.h
++++ b/TheForceEngine/TFE_DarkForces/player.h
+@@ -191,6 +191,7 @@ namespace TFE_DarkForces
+ 	fixed16_16 player_getSquaredDistance(SecObject* obj);
+ 	void player_setupCamera();
+ 	void player_applyDamage(fixed16_16 healthDmg, fixed16_16 shieldDmg, JBool playHitSound);
++	void player_useActionForObject(SecObject* player, fixed16_16 dirX, fixed16_16 dirZ);
+ 
+ 	JBool player_hasWeapon(s32 weaponIndex);
+ 	JBool player_hasItem(s32 itemIndex);
+diff --git a/TheForceEngine/TFE_DarkForces/projectile.cpp b/TheForceEngine/TFE_DarkForces/projectile.cpp
+index 00903ba..3613f97 100644
+--- a/TheForceEngine/TFE_DarkForces/projectile.cpp
++++ b/TheForceEngine/TFE_DarkForces/projectile.cpp
+@@ -1,4 +1,5 @@
+ #include "projectile.h"
++#include "Coop/coop.h"
+ #include "animLogic.h"
+ #include "random.h"
+ #include "player.h"
+@@ -626,6 +627,7 @@ namespace TFE_DarkForces
+ 				ProjectileLogic* projLogic = taskCtx->projLogic;
+ 
+ 				SecObject* obj = projLogic->logic.obj;
++				TFE_Coop::notifyLocalProjectile(projLogic);
+ 				ProjectileHitType projHitType = PHIT_NONE;
+ 				Tick curTick = s_curTick;
+ 
+diff --git a/TheForceEngine/TFE_DarkForces/projectile.h b/TheForceEngine/TFE_DarkForces/projectile.h
+index 5356ec7..58f6e6c 100644
+--- a/TheForceEngine/TFE_DarkForces/projectile.h
++++ b/TheForceEngine/TFE_DarkForces/projectile.h
+@@ -66,6 +66,7 @@ namespace TFE_DarkForces
+ 		
+ 		// TFE
+ 		PROJFLAG_DONOT_SCALE       = FLAG_BIT(2),       // Disable framerate based scaling on 3DOs
++		PROJFLAG_COOP_REPLICATED   = FLAG_BIT(3),       // Co-op event sent or received over the network.
+ 	};
+ 
+ 	struct ProjectileLogic;
+diff --git a/TheForceEngine/TheForceEngine.vcxproj b/TheForceEngine/TheForceEngine.vcxproj
+index 14be74a..66617e7 100644
+--- a/TheForceEngine/TheForceEngine.vcxproj
++++ b/TheForceEngine/TheForceEngine.vcxproj
+@@ -443,6 +443,10 @@ echo ^)";
+     <ClInclude Include="TFE_DarkForces\playerCollision.h" />
+     <ClInclude Include="TFE_DarkForces\playerLogic.h" />
+     <ClInclude Include="TFE_DarkForces\projectile.h" />
++    <ClInclude Include="TFE_DarkForces\Coop\coop.h" />
++    <ClInclude Include="TFE_DarkForces\Coop\coopProtocol.h" />
++    <ClInclude Include="TFE_DarkForces\Coop\coopSession.h" />
++    <ClInclude Include="TFE_DarkForces\Coop\coopTransport.h" />
+     <ClInclude Include="TFE_DarkForces\random.h" />
+     <ClInclude Include="TFE_DarkForces\Scripting\gameScripts.h" />
+     <ClInclude Include="TFE_DarkForces\Scripting\gs_game.h" />
+@@ -867,6 +871,10 @@ echo ^)";
+     <ClCompile Include="TFE_DarkForces\player.cpp" />
+     <ClCompile Include="TFE_DarkForces\playerCollision.cpp" />
+     <ClCompile Include="TFE_DarkForces\projectile.cpp" />
++    <ClCompile Include="TFE_DarkForces\Coop\coop.cpp" />
++    <ClCompile Include="TFE_DarkForces\Coop\coopProtocol.cpp" />
++    <ClCompile Include="TFE_DarkForces\Coop\coopSession.cpp" />
++    <ClCompile Include="TFE_DarkForces\Coop\coopTransport.cpp" />
+     <ClCompile Include="TFE_DarkForces\random.cpp" />
+     <ClCompile Include="TFE_DarkForces\Scripting\gameScripts.cpp" />
+     <ClCompile Include="TFE_DarkForces\Scripting\gs_game.cpp" />
+diff --git a/TheForceEngine/TheForceEngine.vcxproj.filters b/TheForceEngine/TheForceEngine.vcxproj.filters
+index 46c7f8d..bc7f046 100644
+--- a/TheForceEngine/TheForceEngine.vcxproj.filters
++++ b/TheForceEngine/TheForceEngine.vcxproj.filters
+@@ -460,6 +460,18 @@
+     <ClInclude Include="TFE_DarkForces\projectile.h">
+       <Filter>Source\TFE_DarkForces</Filter>
+     </ClInclude>
++    <ClInclude Include="TFE_DarkForces\Coop\coop.h">
++      <Filter>Source\TFE_DarkForces</Filter>
++    </ClInclude>
++    <ClInclude Include="TFE_DarkForces\Coop\coopProtocol.h">
++      <Filter>Source\TFE_DarkForces</Filter>
++    </ClInclude>
++    <ClInclude Include="TFE_DarkForces\Coop\coopSession.h">
++      <Filter>Source\TFE_DarkForces</Filter>
++    </ClInclude>
++    <ClInclude Include="TFE_DarkForces\Coop\coopTransport.h">
++      <Filter>Source\TFE_DarkForces</Filter>
++    </ClInclude>
+     <ClInclude Include="TFE_DarkForces\hitEffect.h">
+       <Filter>Source\TFE_DarkForces</Filter>
+     </ClInclude>
+@@ -1728,6 +1740,18 @@
+     <ClCompile Include="TFE_DarkForces\projectile.cpp">
+       <Filter>Source\TFE_DarkForces</Filter>
+     </ClCompile>
++    <ClCompile Include="TFE_DarkForces\Coop\coop.cpp">
++      <Filter>Source\TFE_DarkForces</Filter>
++    </ClCompile>
++    <ClCompile Include="TFE_DarkForces\Coop\coopProtocol.cpp">
++      <Filter>Source\TFE_DarkForces</Filter>
++    </ClCompile>
++    <ClCompile Include="TFE_DarkForces\Coop\coopSession.cpp">
++      <Filter>Source\TFE_DarkForces</Filter>
++    </ClCompile>
++    <ClCompile Include="TFE_DarkForces\Coop\coopTransport.cpp">
++      <Filter>Source\TFE_DarkForces</Filter>
++    </ClCompile>
+     <ClCompile Include="TFE_DarkForces\hitEffect.cpp">
+       <Filter>Source\TFE_DarkForces</Filter>
+     </ClCompile>
+diff --git a/TheForceEngine/main.cpp b/TheForceEngine/main.cpp
+index e3441ff..c5021ad 100644
+--- a/TheForceEngine/main.cpp
++++ b/TheForceEngine/main.cpp
+@@ -30,11 +30,13 @@
+ #include <TFE_A11y/accessibility.h>
+ #include <algorithm>
+ #include <cinttypes>
++#include <cstdlib>
+ #include <time.h>
+ #include <sys/types.h>
+ #include <sys/timeb.h>
+ #include <TFE_DarkForces/hud.h>
+ #include <TFE_DarkForces/mission.h>
++#include <TFE_DarkForces/Coop/coop.h>
+ #include <TFE_Input/replay.h>
+ 
+ #if ENABLE_EDITOR == 1
+@@ -627,6 +629,12 @@ int main(int argc, char* argv[])
+ 	TFE_SaveSystem::init();
+ 	TFE_A11Y::init();
+ 
++	if (!TFE_Coop::startup(c_gitVersion))
++	{
++		TFE_System::logWrite(LOG_CRITICAL, "Coop", "Co-op networking failed to start.");
++		s_loop = false;
++	}
++
+ 	// Uncomment to test memory region allocator.
+ 	// TFE_Memory::region_test();
+ 
+@@ -769,6 +777,7 @@ int main(int argc, char* argv[])
+ 		if (TFE_A11Y::hasPendingFont()) { TFE_A11Y::loadPendingFont(); } // Can't load new fonts between TFE_Ui::begin() and TFE_Ui::render();
+ 		TFE_Ui::begin();
+ 		TFE_System::update();
++		TFE_Coop::pump();
+ 		TFE_ForceScript::update();
+ 
+ 		// Update
+@@ -991,6 +1000,7 @@ int main(int argc, char* argv[])
+ 		s_curGame = nullptr;
+ 	}
+ 	s_soundPaused = false;
++	TFE_Coop::shutdown();
+ 	game_destroy();
+ 	reticle_destroy();
+ 	inputMapping_shutdown();
+@@ -1073,6 +1083,36 @@ void parseOption(const char* name, const std::vector<const char*>& values, bool
+ 		{
+ 			TFE_Settings::getTempSettings()->skipLoadDelay = true;
+ 		}
++		else if (strcasecmp(name, "coop-host") == 0)
++		{
++			std::uint16_t port = 27500;
++			if (!values.empty())
++			{
++				const unsigned long parsed = std::strtoul(values[0], nullptr, 10);
++				if (parsed > 0 && parsed <= 65535) { port = static_cast<std::uint16_t>(parsed); }
++			}
++			TFE_Coop::configureHost(port);
++			s_startupGame = Game_Dark_Forces;
++		}

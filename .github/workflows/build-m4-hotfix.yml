@@ -17,7 +17,9 @@ jobs:
         run: |
           set -euxo pipefail
           cat patches/m4-hotfix/part-*.txt > hotfix.patch.xz.b64
-          base64 --decode hotfix.patch.xz.b64 > hotfix.patch.xz
+          tr -cd 'A-Za-z0-9+/=\n\r' < hotfix.patch.xz.b64 > hotfix.clean.b64
+          base64 --ignore-garbage --decode hotfix.clean.b64 > hotfix.patch.xz
+          xz --test hotfix.patch.xz
           xz --decompress --stdout hotfix.patch.xz > hotfix.patch
           sha256sum hotfix.patch hotfix.patch.xz hotfix.patch.xz.b64 | tee HOTFIX-SHA256.txt
           sed -n '1,80p' hotfix.patch

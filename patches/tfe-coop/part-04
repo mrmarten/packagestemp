@@ -1,0 +1,219 @@
++		event.sectorIndex = static_cast<std::int16_t>(player->sector->index);
++		s_session.queueUseEvent(event);
++	}
++}
+diff --git a/TheForceEngine/TFE_DarkForces/Coop/coop.h b/TheForceEngine/TFE_DarkForces/Coop/coop.h
+new file mode 100644
+index 0000000..2d93f1e
+--- /dev/null
++++ b/TheForceEngine/TFE_DarkForces/Coop/coop.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include <TFE_System/types.h>
++
++#include <cstdint>
++
++namespace TFE_DarkForces { struct ProjectileLogic; }
++struct SecObject;
++
++namespace TFE_Coop
++{
++	// Command-line configuration. These functions only store configuration;
++	// startup() opens the socket after TFE paths and logging are initialized.
++	void configureHost(std::uint16_t port);
++	void configureClient(const char* host, std::uint16_t port);
++	void configurePlayerName(const char* name);
++	void configureDebugLogging(bool enabled);
++
++	bool startup(const char* buildId);
++	void shutdown();
++	void pump();
++
++	bool enabled();
++	bool connected();
++	bool isHost();
++	std::uint16_t localPort();
++
++	// Dark Forces mission lifecycle hooks.
++	void missionBegin();
++	void missionUpdate();
++	void missionEnd();
++
++	// Gameplay event hooks.
++	void notifyLocalProjectile(TFE_DarkForces::ProjectileLogic* projectile);
++	void notifyLocalUse(SecObject* player);
++}
+diff --git a/TheForceEngine/TFE_DarkForces/Coop/coopProtocol.cpp b/TheForceEngine/TFE_DarkForces/Coop/coopProtocol.cpp
+new file mode 100644
+index 0000000..a3c47ad
+--- /dev/null
++++ b/TheForceEngine/TFE_DarkForces/Coop/coopProtocol.cpp
+@@ -0,0 +1,294 @@
++#include "coopProtocol.h"
++
++#include <algorithm>
++#include <cstring>
++
++namespace TFE_Coop
++{
++namespace Protocol
++{
++	namespace
++	{
++		class Writer
++		{
++		public:
++			Writer(std::uint8_t* data, std::size_t capacity) : m_data(data), m_capacity(capacity) {}
++
++			bool u8(std::uint8_t value) { return raw(&value, 1); }
++			bool u16(std::uint16_t value)
++			{
++				const std::uint8_t bytes[2] = {
++					static_cast<std::uint8_t>((value >> 8) & 0xff),
++					static_cast<std::uint8_t>(value & 0xff)
++				};
++				return raw(bytes, sizeof(bytes));
++			}
++			bool i16(std::int16_t value) { return u16(static_cast<std::uint16_t>(value)); }
++			bool u32(std::uint32_t value)
++			{
++				const std::uint8_t bytes[4] = {
++					static_cast<std::uint8_t>((value >> 24) & 0xff),
++					static_cast<std::uint8_t>((value >> 16) & 0xff),
++					static_cast<std::uint8_t>((value >> 8) & 0xff),
++					static_cast<std::uint8_t>(value & 0xff)
++				};
++				return raw(bytes, sizeof(bytes));
++			}
++			bool i32(std::int32_t value) { return u32(static_cast<std::uint32_t>(value)); }
++			bool u64(std::uint64_t value)
++			{
++				return u32(static_cast<std::uint32_t>(value >> 32)) &&
++					u32(static_cast<std::uint32_t>(value & 0xffffffffu));
++			}
++			bool string(const std::string& value, std::size_t maxLength)
++			{
++				const std::size_t length = std::min(value.size(), maxLength);
++				return u8(static_cast<std::uint8_t>(length)) && raw(value.data(), length);
++			}
++			bool raw(const void* data, std::size_t size)
++			{
++				if (m_size + size > m_capacity || (size && !data)) { return false; }
++				if (size) { std::memcpy(m_data + m_size, data, size); }
++				m_size += size;
++				return true;
++			}
++			std::size_t size() const { return m_size; }
++		private:
++			std::uint8_t* m_data = nullptr;
++			std::size_t m_capacity = 0;
++			std::size_t m_size = 0;
++		};
++
++		class Reader
++		{
++		public:
++			Reader(const std::uint8_t* data, std::size_t size) : m_data(data), m_size(size) {}
++			bool u8(std::uint8_t& value) { return raw(&value, 1); }
++			bool u16(std::uint16_t& value)
++			{
++				std::uint8_t bytes[2];
++				if (!raw(bytes, sizeof(bytes))) { return false; }
++				value = static_cast<std::uint16_t>((std::uint16_t(bytes[0]) << 8) | bytes[1]);
++				return true;
++			}
++			bool i16(std::int16_t& value)
++			{
++				std::uint16_t temp;
++				if (!u16(temp)) { return false; }
++				value = static_cast<std::int16_t>(temp);
++				return true;
++			}
++			bool u32(std::uint32_t& value)
++			{
++				std::uint8_t bytes[4];
++				if (!raw(bytes, sizeof(bytes))) { return false; }
++				value = (std::uint32_t(bytes[0]) << 24) |
++					(std::uint32_t(bytes[1]) << 16) |
++					(std::uint32_t(bytes[2]) << 8) |
++					std::uint32_t(bytes[3]);
++				return true;
++			}
++			bool i32(std::int32_t& value)
++			{
++				std::uint32_t temp;
++				if (!u32(temp)) { return false; }
++				value = static_cast<std::int32_t>(temp);
++				return true;
++			}
++			bool u64(std::uint64_t& value)
++			{
++				std::uint32_t high, low;
++				if (!u32(high) || !u32(low)) { return false; }
++				value = (std::uint64_t(high) << 32) | low;
++				return true;
++			}
++			bool string(std::string& value, std::size_t maxLength)
++			{
++				std::uint8_t length;
++				if (!u8(length) || length > maxLength || remaining() < length) { return false; }
++				value.assign(reinterpret_cast<const char*>(m_data + m_offset), length);
++				m_offset += length;
++				return true;
++			}
++			bool raw(void* data, std::size_t size)
++			{
++				if (m_offset + size > m_size || (size && !data)) { return false; }
++				if (size) { std::memcpy(data, m_data + m_offset, size); }
++				m_offset += size;
++				return true;
++			}
++			std::size_t remaining() const { return m_size - m_offset; }
++		private:
++			const std::uint8_t* m_data = nullptr;
++			std::size_t m_size = 0;
++			std::size_t m_offset = 0;
++		};
++
++		bool writeHeader(const Header& header, std::uint16_t payloadSize, Writer& writer)
++		{
++			return writer.u32(Magic) && writer.u16(Version) &&
++				writer.u8(static_cast<std::uint8_t>(header.type)) && writer.u8(header.flags) &&
++				writer.u32(header.sessionId) && writer.u32(header.sequence) &&
++				writer.u16(payloadSize) && writer.u16(0);
++		}
++
++		template<typename WritePayload>
++		bool encode(const Header& header, WritePayload writePayload, Datagram& out)
++		{
++			std::array<std::uint8_t, MaxPacketSize - HeaderSize> payload = {};
++			Writer payloadWriter(payload.data(), payload.size());
++			if (!writePayload(payloadWriter) || payloadWriter.size() > 0xffffu) { return false; }
++
++			Writer packetWriter(out.bytes.data(), out.bytes.size());
++			if (!writeHeader(header, static_cast<std::uint16_t>(payloadWriter.size()), packetWriter) ||
++				!packetWriter.raw(payload.data(), payloadWriter.size()))
++			{
++				return false;
++			}
++			out.size = packetWriter.size();
++			return true;
++		}
++	}
++
++	bool decodePacket(const std::uint8_t* data, std::size_t size, PacketView& out)
++	{
++		if (!data || size < HeaderSize || size > MaxPacketSize) { return false; }
++		Reader reader(data, size);
++		std::uint32_t magic;
++		std::uint16_t version;
++		std::uint8_t type;
++		std::uint16_t reserved;
++		if (!reader.u32(magic) || !reader.u16(version) || !reader.u8(type) || !reader.u8(out.header.flags) ||
++			!reader.u32(out.header.sessionId) || !reader.u32(out.header.sequence) ||
++			!reader.u16(out.header.payloadSize) || !reader.u16(reserved))
++		{
++			return false;
++		}
++		if (magic != Magic || version != Version || reserved != 0 ||

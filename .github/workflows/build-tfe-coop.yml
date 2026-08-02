@@ -27,6 +27,8 @@ jobs:
           test "$actual" = "$PATCH_SHA256"
           git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
           git -C tfe checkout "$TFE_SHA"
+          git -C tfe config user.name "OpenAI CI Build"
+          git -C tfe config user.email "build@openai.local"
           git -C tfe am "$GITHUB_WORKSPACE/tfe-coop.patch"
 
       - name: Run networking tests
@@ -104,6 +106,8 @@ jobs:
           if ($actual -ne $env:PATCH_SHA256) { throw "Patch checksum mismatch: $actual" }
           git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
           git -C tfe checkout $env:TFE_SHA
+          git -C tfe config user.name "OpenAI CI Build"
+          git -C tfe config user.email "build@openai.local"
           git -C tfe am (Resolve-Path tfe-coop.patch)
 
       - name: Build Windows x64

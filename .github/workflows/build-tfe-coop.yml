@@ -9,7 +9,7 @@ permissions:
 
 env:
   TFE_SHA: 54eab324e9b265c503b51c3690f030f42a0f9fcc
-  PATCH_SHA256: 3721f2a2c97a18686ac72efc7f16dc9edd7c5a0bbdcab99da1eb86cd5243ca27
+  PATCH_SHA256: f9903b5a6e8df39b957f15171e548cfb157781bafc4fa2de68451875f32f75e4
 
 jobs:
   linux:
@@ -21,7 +21,11 @@ jobs:
       - name: Reconstruct and apply exact patch
         shell: bash
         run: |
-          cat patches/tfe-coop/part-* > tfe-coop.patch
+          : > tfe-coop.patch
+          for part in $(find patches/tfe-coop -maxdepth 1 -type f -name 'part-*' | sort); do
+            cat "$part" >> tfe-coop.patch
+            if [ -n "$(tail -c 1 "$part")" ]; then printf '\n' >> tfe-coop.patch; fi
+          done
           actual="$(sha256sum tfe-coop.patch | awk '{print $1}')"
           echo "Reconstructed patch SHA-256: $actual"
           test "$actual" = "$PATCH_SHA256"
@@ -97,6 +101,7 @@ jobs:
               $text = [System.IO.File]::ReadAllText($part.FullName)
               $text = $text.Replace("`r`n", "`n")
               $output.Write($text)
+              if (-not $text.EndsWith("`n")) { $output.Write("`n") }
             }
           } finally {
             $output.Dispose()

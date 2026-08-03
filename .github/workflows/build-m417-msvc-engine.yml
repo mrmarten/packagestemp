@@ -1,0 +1,152 @@
+name: Build TFE Co-op M4.1.7 MSVC engine
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TFE_SHA: 54eab324e9b265c503b51c3690f030f42a0f9fcc
+  B64_SHA256: f2a7eec673a104572bc8d5f70aabdf872b4581a36c5b89ddd8688e810b12d458
+  XZ_SHA256: 95995772a116923b9c26773c1a97468ce931f6b9240a3a3a21bd8ef7283c11dd
+  PATCH_SHA256: 930647d0fd18912203c0dda3b028f950134830e84925c01700c65f48d40e41c0
+
+jobs:
+  windows:
+    name: Native MSVC x64 engine
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Reconstruct and apply exact cumulative co-op patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parts = Get-ChildItem m417-patch/part-*.txt | Sort-Object Name
+          if ($parts.Count -ne 12) { throw "Expected 12 patch chunks, found $($parts.Count)." }
+          $raw = ($parts | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join ''
+          $compact = $raw -replace '\s',''
+          [IO.File]::WriteAllText('m417.patch.xz.b64', $compact, [Text.Encoding]::ASCII)
+          $b64Hash = (Get-FileHash m417.patch.xz.b64 -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($b64Hash -ne $env:B64_SHA256) { throw "Base64 checksum mismatch: $b64Hash" }
+
+          [IO.File]::WriteAllBytes('m417.patch.xz', [Convert]::FromBase64String($compact))
+          $xzHash = (Get-FileHash m417.patch.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($xzHash -ne $env:XZ_SHA256) { throw "XZ checksum mismatch: $xzHash" }
+
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          compressed = Path('m417.patch.xz').read_bytes()
+          patch = lzma.decompress(compressed)
+          Path('m417.patch').write_bytes(patch)
+          print('Patch bytes:', len(patch))
+          print('Patch SHA-256:', hashlib.sha256(patch).hexdigest())
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Patch decompression failed.' }
+          $patchHash = (Get-FileHash m417.patch -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($patchHash -ne $env:PATCH_SHA256) { throw "Patch checksum mismatch: $patchHash" }
+
+          git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
+          git -C tfe checkout $env:TFE_SHA
+          git -C tfe apply --check (Resolve-Path m417.patch)
+          git -C tfe apply (Resolve-Path m417.patch)
+          git -C tfe diff --check
+          if (-not (Test-Path tfe\TheForceEngine\TFE_DarkForces\Coop\coop.h -PathType Leaf)) {
+            throw 'The reconstructed source tree is missing the co-op implementation.'
+          }
+
+      - name: Force static native MSVC runtime
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          project = Path('tfe/TheForceEngine/TheForceEngine.vcxproj')
+          text = project.read_text(encoding='utf-8-sig')
+          marker = "  <ItemDefinitionGroup Condition=\"'$(Configuration)|$(Platform)'=='BuildForRelease|x64'\">\n    <ClCompile>\n"
+          replacement = marker + "      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>\n"
+          if marker not in text:
+              raise SystemExit('BuildForRelease x64 ClCompile block was not found.')
+          if '<RuntimeLibrary>MultiThreaded</RuntimeLibrary>' not in text:
+              text = text.replace(marker, replacement, 1)
+          project.write_text(text, encoding='utf-8-sig', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to set the static MSVC runtime.' }
+          Select-String -LiteralPath tfe\TheForceEngine\TheForceEngine.vcxproj -SimpleMatch '<RuntimeLibrary>MultiThreaded</RuntimeLibrary>'
+
+      - name: Build Windows x64 with MSVC
+        shell: pwsh
+        run: |
+          msbuild tfe\TheForceEngine.sln /m /restore `
+            /p:Configuration=BuildForRelease `
+            /p:Platform=x64 `
+            /p:PlatformToolset=v143 `
+            /p:WindowsTargetPlatformVersion=10.0
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE." }
+
+      - name: Collect and validate engine dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Get-ChildItem -Path tfe -Recurse -Filter *.exe |
+            Where-Object { $_.Name -match '^TheForceEngine\.exe$|^theforceengine\.exe$' -and $_.FullName -match 'BuildForRelease|Release' } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+          if (-not $exe) { throw 'The Force Engine executable was not found after MSBuild.' }
+
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item $exe.FullName artifact\theforceengine.exe
+          foreach ($dll in @('SDL2.dll','SDL2_image.dll','ogg.dll','theora.dll','vorbis.dll')) {
+            $source = Join-Path 'tfe\TheForceEngine' $dll
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required runtime DLL missing: $dll" }
+            Copy-Item $source artifact\$dll
+          }
+          Copy-Item m417.patch artifact\TFE-Coop-Milestone-4.1.7-Source.patch
+          Copy-Item tfe\LICENSE artifact\LICENSE
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+          if ([string]::IsNullOrWhiteSpace($vs)) { throw 'Visual Studio C++ toolchain was not found for dependency validation.' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $command = 'call "' + $vcvars + '" && dumpbin.exe /headers artifact\theforceengine.exe > artifact\PE-HEADERS.txt && dumpbin.exe /dependents artifact\theforceengine.exe > artifact\DEPENDENCIES.txt'
+          & cmd.exe /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw 'dumpbin validation failed.' }
+
+          $deps = Get-Content artifact\DEPENDENCIES.txt -Raw
+          foreach ($forbidden in @('libunwind.dll','libc++.dll','VCRUNTIME140.dll','VCRUNTIME140_1.dll','MSVCP140.dll','MSVCP140_1.dll','MSVCP140_2.dll')) {
+            if ($deps -match [regex]::Escape($forbidden)) { throw "Forbidden runtime dependency remains: $forbidden" }
+          }
+          $headers = Get-Content artifact\PE-HEADERS.txt -Raw
+          if ($headers -notmatch 'machine \(x64\)') { throw 'The resulting executable is not x64.' }
+
+          Push-Location artifact
+          try {
+            $smoke = Start-Process -FilePath .\theforceengine.exe -ArgumentList '--help' -PassThru
+            Start-Sleep -Seconds 3
+            if (-not $smoke.HasExited) {
+              Stop-Process -Id $smoke.Id -Force
+              $smoke.WaitForExit()
+            }
+          } catch {
+            throw "The native engine failed Windows loader smoke testing: $($_.Exception.Message)"
+          } finally {
+            Pop-Location
+          }
+
+          Get-FileHash artifact\* -Algorithm SHA256 |
+            Sort-Object Path |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), [IO.Path]::GetFileName($_.Path) } |
+            Set-Content artifact\SHA256SUMS.txt -Encoding Ascii
+          Get-Content artifact\DEPENDENCIES.txt
+          Get-Content artifact\SHA256SUMS.txt
+
+      - name: Upload native engine artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-4.1.7-MSVC-x64
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7

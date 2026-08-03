@@ -54,8 +54,8 @@ jobs:
           foreach ($forbidden in @('libunwind.dll','libc++.dll','VCRUNTIME140.dll','MSVCP140.dll')) {
             if ($deps -match [regex]::Escape($forbidden)) { throw "Unexpected dynamic runtime dependency: $forbidden" }
           }
-          & .\tfe_coop_splitscreen_msvc.exe --help
-          if ($LASTEXITCODE -ne 2) { throw "Unexpected --help exit code: $LASTEXITCODE" }
+          $help = Start-Process -FilePath .\tfe_coop_splitscreen_msvc.exe -ArgumentList '--help' -NoNewWindow -Wait -PassThru
+          if ($help.ExitCode -ne 2) { throw "Unexpected --help exit code: $($help.ExitCode)" }
           Get-FileHash .\tfe_coop_splitscreen_msvc.exe -Algorithm SHA256 | Format-List | Out-File supervisor-sha256.txt
           Get-Content supervisor-dependencies.txt
 

@@ -13,11 +13,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Decode exact source
+      - name: Decode exact source and launcher
         shell: pwsh
         run: |
           $encoded = (Get-Content m42-supervisor/coop_splitscreen_win.cpp.xz.b64 -Raw) -replace '\s',''
           [IO.File]::WriteAllBytes('supervisor-source.xz', [Convert]::FromBase64String($encoded))
+          $launcherEncoded = (Get-Content m42-supervisor/Start-TFE-Coop-Local-4.1.4.ps1.xz.b64 -Raw) -replace '\s',''
+          [IO.File]::WriteAllBytes('launcher-source.xz', [Convert]::FromBase64String($launcherEncoded))
           @'
           import hashlib, lzma
           from pathlib import Path
@@ -26,8 +28,32 @@ jobs:
           digest = hashlib.sha256(source).hexdigest()
           if digest != 'b7eccd3906fb9a6682b16e2b65ccdd4fe3d66fc95e86c0ebc3ea1d97e8c6ca0d':
               raise SystemExit(f'source checksum mismatch: {digest}')
+          launcher = lzma.decompress(Path('launcher-source.xz').read_bytes())
+          Path('Start-TFE-Coop-Local.ps1').write_bytes(launcher)
+          launcher_digest = hashlib.sha256(launcher).hexdigest()
+          if launcher_digest != '05233bd6c182451097ad157b3e7f1ba77b27eba7f6dffed315cf28f377215eff':
+              raise SystemExit(f'launcher checksum mismatch: {launcher_digest}')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw 'Source decode failed.' }
+
+      - name: Parse launcher with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\Start-TFE-Coop-Local.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Force
+            throw 'Windows PowerShell parser reported launcher syntax errors.'
+          }
+          $text = Get-Content .\Start-TFE-Coop-Local.ps1 -Raw
+          if ($text -notmatch 'Unblock-File') { throw 'Launcher is missing Mark-of-the-Web cleanup.' }
+          if ($text -notmatch 'Static MSVC supervisor active') { throw 'Static-supervisor status message is missing.' }
+          Write-Host 'Windows PowerShell 5.1 launcher syntax: PASS'
 
       - name: Build static x64 supervisor with MSVC
         shell: pwsh
@@ -67,5 +93,6 @@ jobs:
             supervisor-dependencies.txt
             supervisor-sha256.txt
             coop_splitscreen_win.cpp
+            Start-TFE-Coop-Local.ps1
           if-no-files-found: error
           retention-days: 7

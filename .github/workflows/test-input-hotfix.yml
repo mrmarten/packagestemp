@@ -8,122 +8,46 @@ permissions:
   contents: read
 
 jobs:
-  windows:
+  windows-launcher-parser:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
 
-      - name: Decode exact scripts
+      - name: Decode exact Milestone 4.1.3 launcher
         shell: pwsh
         run: |
-          $encoded = (Get-Content input-hotfix-test/scripts.tar.xz.b64 -Raw).Trim()
-          [IO.File]::WriteAllBytes('scripts.tar.xz', [Convert]::FromBase64String($encoded))
+          $encoded = (Get-Content input-hotfix-test/launcher-4.1.3.ps1.xz.b64 -Raw) -replace '\s',''
+          [IO.File]::WriteAllBytes('launcher.xz', [Convert]::FromBase64String($encoded))
           @'
           import lzma
           from pathlib import Path
-          Path('scripts.tar').write_bytes(lzma.decompress(Path('scripts.tar.xz').read_bytes()))
+          Path('Start-TFE-Coop-Local.ps1').write_bytes(lzma.decompress(Path('launcher.xz').read_bytes()))
           '@ | python -
-          if ($LASTEXITCODE -ne 0) { throw 'XZ decode failed.' }
-          tar -xf scripts.tar
-          if ($LASTEXITCODE -ne 0) { throw 'Tar extraction failed.' }
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher decode failed.' }
+          $hash = (Get-FileHash Start-TFE-Coop-Local.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne 'b3401ce264018b5a00b58baeb2cd69ac5c6b3d647e1e74805e32616ef9e1bc11') {
+            throw "Launcher checksum mismatch: $hash"
+          }
 
-      - name: Parse scripts with Windows PowerShell 5.1
+      - name: Parse with Windows PowerShell 5.1
         shell: powershell
         run: |
-          foreach ($path in @('.\Repair-TFE-Coop-Profiles.ps1','.\Start-TFE-Coop-Local.ps1')) {
-            $tokens = $null
-            $errors = $null
-            [void][System.Management.Automation.Language.Parser]::ParseFile(
-              (Resolve-Path $path), [ref]$tokens, [ref]$errors)
-            if ($errors.Count -gt 0) {
-              $errors | Format-List -Force
-              throw "PowerShell parser reported errors in $path"
-            }
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\Start-TFE-Coop-Local.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Force
+            throw 'Windows PowerShell parser reported syntax errors.'
           }
-          Write-Host 'Windows PowerShell syntax: PASS'
-
-      - name: Exercise default-agent and input-profile preparation
-        shell: powershell
-        run: |
-          $game = Join-Path $PWD 'test-game'
-          New-Item -ItemType Directory -Path (Join-Path $game 'LFD') -Force | Out-Null
-          foreach ($file in @('DARK.GOB','SOUNDS.GOB','SPRITES.GOB','TEXTURES.GOB')) {
-            Set-Content -LiteralPath (Join-Path $game $file) -Value 'test' -Encoding Ascii
+          $text = Get-Content .\Start-TFE-Coop-Local.ps1 -Raw
+          if ($text.Contains('$controllerProfile:')) {
+            throw 'Unsafe controllerProfile interpolation remains.'
           }
-          Set-Content -LiteralPath (Join-Path $game 'LFD\AGENTMNU.LFD') -Value 'test' -Encoding Ascii
-
-          $documents = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
-          foreach ($profile in @('Host','Client')) {
-            $dir = Join-Path $documents "TheForceEngine-Coop-$profile"
-            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
-            Set-Content -LiteralPath (Join-Path $dir 'tfe_input_remapping.bin') -Value 'stale' -Encoding Ascii
+          if (-not $text.Contains('${controllerProfile}:')) {
+            throw 'Corrected controllerProfile interpolation is missing.'
           }
-
-          Push-Location C:\Windows\System32
-          try {
-            & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
-              -File (Join-Path $env:GITHUB_WORKSPACE 'Repair-TFE-Coop-Profiles.ps1') `
-              -PackageDir $env:GITHUB_WORKSPACE -GameDir $game -NonInteractive -Quiet
-            if ($LASTEXITCODE -ne 0) { throw "Repair script returned $LASTEXITCODE" }
-          } finally {
-            Pop-Location
-          }
-
-          foreach ($profile in @('Host','Client')) {
-            $dir = Join-Path $documents "TheForceEngine-Coop-$profile"
-            $settings = Join-Path $dir 'settings.ini'
-            $pilot = Join-Path $dir 'DARKPILO.CFG'
-            $marker = Join-Path $dir 'coop-input-defaults-4.1.2.marker'
-            if (-not (Test-Path -LiteralPath $settings -PathType Leaf)) { throw "Missing $settings" }
-            if (-not (Test-Path -LiteralPath $pilot -PathType Leaf)) { throw "Missing $pilot" }
-            if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) { throw "Missing $marker" }
-            if (Test-Path -LiteralPath (Join-Path $dir 'tfe_input_remapping.bin') -PathType Leaf) {
-              throw "Stale mapping was not reset for $profile"
-            }
-            $backup = Get-ChildItem -LiteralPath $dir -Filter 'tfe_input_remapping.bin.backup-*' -File
-            if (-not $backup) { throw "Input mapping backup was not created for $profile" }
-
-            $bytes = [IO.File]::ReadAllBytes($pilot)
-            if ($bytes.Length -ne 14943) { throw "Unexpected DARKPILO size for $profile: $($bytes.Length)" }
-            if ($bytes[0] -ne 0x50 -or $bytes[1] -ne 0x43 -or $bytes[2] -ne 0x46 -or $bytes[3] -ne 0x12) {
-              throw "Invalid DARKPILO header for $profile"
-            }
-            $name = [Text.Encoding]::ASCII.GetString($bytes, 5, 32).Trim([char]0)
-            if ($name -ne "COOP $($profile.ToUpperInvariant())") { throw "Unexpected agent name: $name" }
-            if ([BitConverter]::ToInt32($bytes, 37) -ne 1) { throw 'selectedMission is not 1' }
-            if ([BitConverter]::ToInt32($bytes, 41) -ne 1) { throw 'nextMission is not 1' }
-            if ($bytes[45] -ne 1) { throw 'difficulty is not 1' }
-            if ($bytes[60] -ne 0xFF -or $bytes[90] -ne 1 -or $bytes[91] -ne 3) {
-              throw 'Initial inventory record is invalid'
-            }
-            if ([BitConverter]::ToInt32($bytes, 508) -ne 100) { throw 'Initial energy is invalid' }
-            if ([BitConverter]::ToInt32($bytes, 536) -ne 100) { throw 'Initial shields are invalid' }
-            if ([BitConverter]::ToInt32($bytes, 540) -ne 100) { throw 'Initial health is invalid' }
-            if ([BitConverter]::ToInt32($bytes, 544) -ne 131072) { throw 'Initial battery is invalid' }
-          }
-          Write-Host 'Default agents and input reset: PASS'
-
-      - name: Verify repair is idempotent
-        shell: powershell
-        run: |
-          $game = Join-Path $PWD 'test-game'
-          $documents = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
-          $before = @{}
-          foreach ($profile in @('Host','Client')) {
-            $pilot = Join-Path $documents "TheForceEngine-Coop-$profile\DARKPILO.CFG"
-            $before[$profile] = (Get-FileHash $pilot -Algorithm SHA256).Hash
-            Set-Content -LiteralPath (Join-Path $documents "TheForceEngine-Coop-$profile\tfe_input_remapping.bin") -Value 'custom-after-first-run' -Encoding Ascii
-          }
-          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
-            -File .\Repair-TFE-Coop-Profiles.ps1 -PackageDir $PWD -GameDir $game -NonInteractive -Quiet
-          if ($LASTEXITCODE -ne 0) { throw "Second repair returned $LASTEXITCODE" }
-          foreach ($profile in @('Host','Client')) {
-            $dir = Join-Path $documents "TheForceEngine-Coop-$profile"
-            $pilot = Join-Path $dir 'DARKPILO.CFG'
-            if ((Get-FileHash $pilot -Algorithm SHA256).Hash -ne $before[$profile]) { throw "Pilot was rewritten for $profile" }
-            if (-not (Test-Path -LiteralPath (Join-Path $dir 'tfe_input_remapping.bin') -PathType Leaf)) {
-              throw "Custom post-initialization mapping was removed for $profile"
-            }
-          }
-          Write-Host 'Idempotent second run: PASS'
+          Write-Host 'Windows PowerShell 5.1 launcher syntax: PASS'

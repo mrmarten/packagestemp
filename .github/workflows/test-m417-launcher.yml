@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+env:
+  ENGINE_BUILD_RUN_ID: 30859082890
+  ENGINE_ARTIFACT_NAME: TFE-Coop-Milestone-4.1.7-MSVC-x64-self-contained
+
 jobs:
   windows-powershell-51:
     runs-on: windows-2025
@@ -25,7 +29,7 @@ jobs:
           from pathlib import Path
           items = [
               ('launcher.xz', 'Start-TFE-Coop-Local.ps1', 'eb0afd104463d3e5e5fa88d4396088f0bd170960eb37f16d031e6ade1382c278'),
-              ('verifier.xz', 'VERIFY-WINDOWS.ps1', '03768bf3bb3703f60ff496bf7dc60fe820ec9363aa8b46d5477f691658cf0382'),
+              ('verifier.xz', 'VERIFY-WINDOWS.ps1', 'be62dd6081994387415fcd2943985ea14923a746739d31fbef7a62b9a3ea5779'),
           ]
           for compressed_name, output_name, expected in items:
               source = lzma.decompress(Path(compressed_name).read_bytes())
@@ -89,3 +93,41 @@ jobs:
             }
           }
           Write-Host 'All layout/input preflight paths: PASS'
+
+      - name: Execute the exact verifier against the native self-contained artifact
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Path verify-package -Force | Out-Null
+          gh run download $env:ENGINE_BUILD_RUN_ID --repo $env:GITHUB_REPOSITORY `
+            --name $env:ENGINE_ARTIFACT_NAME --dir verify-package
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download the native engine artifact.' }
+
+          Move-Item verify-package\DEPENDENCIES.txt verify-package\NATIVE-MSVC-DEPENDENCIES.txt
+          Move-Item verify-package\PE-HEADERS.txt verify-package\NATIVE-MSVC-PE-HEADERS.txt
+          Move-Item verify-package\SHA256SUMS.txt verify-package\NATIVE-MSVC-ARTIFACT-SHA256SUMS.txt
+          Copy-Item .\Start-TFE-Coop-Local.ps1 verify-package\Start-TFE-Coop-Local.ps1
+          Copy-Item .\VERIFY-WINDOWS.ps1 verify-package\VERIFY-WINDOWS.ps1
+
+          foreach ($name in @(
+            'Host-Coop.bat','Join-Coop.bat','Start-Local-SplitScreen-Keyboard-Controller.bat',
+            'Repair-TFE-Coop-Profiles.ps1','Repair-TFE-Coop-Profiles.bat','SETUP-WINDOWS.bat',
+            'MILESTONE4_1_7_NATIVE_MSVC_FIX.txt','BUILD-PROVENANCE.txt',
+            'MICROSOFT-VC-RUNTIME-NOTE.txt'
+          )) {
+            Set-Content -LiteralPath (Join-Path verify-package $name) -Value 'CI package-verifier fixture' -Encoding Ascii
+          }
+
+          Get-ChildItem -LiteralPath verify-package -Recurse -File |
+            Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
+            Sort-Object FullName |
+            ForEach-Object {
+              $relative = $_.FullName.Substring((Resolve-Path verify-package).Path.Length + 1).Replace('\\','/')
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "${hash}  ${relative}"
+            } | Set-Content verify-package\SHA256SUMS.txt -Encoding Ascii
+
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File verify-package\VERIFY-WINDOWS.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Exact package verifier returned $LASTEXITCODE." }
+          Write-Host 'Exact self-contained package verifier execution: PASS'

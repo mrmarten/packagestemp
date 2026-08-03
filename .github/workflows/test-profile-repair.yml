@@ -72,6 +72,7 @@ jobs:
             Pop-Location
           }
 
+          $expectedSourcePath = (($game -replace '\\','/') + '/')
           foreach ($profile in @('Host','Client')) {
             $settings = Join-Path $documents "TheForceEngine-Coop-$profile\settings.ini"
             if (-not (Test-Path -LiteralPath $settings -PathType Leaf)) {
@@ -80,7 +81,7 @@ jobs:
             $content = Get-Content -LiteralPath $settings -Raw
             if ($content -notmatch '(?im)^\[Dark_Forces\]\s*$') { throw "Missing Dark_Forces section in $settings" }
             if ($content -notmatch '(?im)^sourcePath\s*=') { throw "Missing sourcePath in $settings" }
-            if ($content -notmatch [regex]::Escape(($game.Replace('\\','/') + '/'))) {
+            if ($content -notmatch [regex]::Escape($expectedSourcePath)) {
               throw "Incorrect sourcePath in $settings`n$content"
             }
           }

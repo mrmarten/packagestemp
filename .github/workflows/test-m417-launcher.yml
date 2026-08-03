@@ -59,8 +59,12 @@ jobs:
         run: |
           foreach ($layout in @('Vertical','Horizontal')) {
             foreach ($mode in @('KeyboardController','ControllerKeyboard','TwoControllers')) {
-              $output = & .\Start-TFE-Coop-Local.ps1 -Layout $layout -InputMode $mode -PreflightOnly
-              if ($LASTEXITCODE -ne 0) { throw "Preflight failed: $layout / $mode" }
+              $output = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+                -File .\Start-TFE-Coop-Local.ps1 -Layout $layout -InputMode $mode -PreflightOnly 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                $output | ForEach-Object { Write-Host $_ }
+                throw "Preflight failed: $layout / $mode"
+              }
               $json = $output | Where-Object { "$_" -match '^\{.*\}$' } | Select-Object -Last 1
               if (-not $json) { throw "No preflight JSON: $layout / $mode" }
               $data = $json | ConvertFrom-Json

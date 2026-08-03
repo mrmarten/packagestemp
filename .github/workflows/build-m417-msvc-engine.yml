@@ -66,10 +66,10 @@ jobs:
           from pathlib import Path
           project = Path('tfe/TheForceEngine/TheForceEngine.vcxproj')
           text = project.read_text(encoding='utf-8-sig')
-          marker = "  <ItemDefinitionGroup Condition=\"'$(Configuration)|$(Platform)'=='BuildForRelease|x64'\">\n    <ClCompile>\n"
+          marker = "  <ItemDefinitionGroup Condition=\"'$(Configuration)|$(Platform)'=='Release|x64'\">\n    <ClCompile>\n"
           replacement = marker + "      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>\n"
           if marker not in text:
-              raise SystemExit('BuildForRelease x64 ClCompile block was not found.')
+              raise SystemExit('Release x64 ClCompile block was not found.')
           if '<RuntimeLibrary>MultiThreaded</RuntimeLibrary>' not in text:
               text = text.replace(marker, replacement, 1)
           project.write_text(text, encoding='utf-8-sig', newline='\n')
@@ -81,7 +81,7 @@ jobs:
         shell: pwsh
         run: |
           msbuild tfe\TheForceEngine.sln /m /restore `
-            /p:Configuration=BuildForRelease `
+            /p:Configuration=Release `
             /p:Platform=x64 `
             /p:PlatformToolset=v143 `
             /p:WindowsTargetPlatformVersion=10.0
@@ -92,7 +92,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $exe = Get-ChildItem -Path tfe -Recurse -Filter *.exe |
-            Where-Object { $_.Name -match '^TheForceEngine\.exe$|^theforceengine\.exe$' -and $_.FullName -match 'BuildForRelease|Release' } |
+            Where-Object { $_.Name -match '^TheForceEngine\.exe$|^theforceengine\.exe$' -and $_.FullName -match '\\Release\\' } |
             Sort-Object Length -Descending |
             Select-Object -First 1
           if (-not $exe) { throw 'The Force Engine executable was not found after MSBuild.' }

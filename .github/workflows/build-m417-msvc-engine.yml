@@ -111,14 +111,49 @@ jobs:
           $vs = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
           if ([string]::IsNullOrWhiteSpace($vs)) { throw 'Visual Studio C++ toolchain was not found for dependency validation.' }
           $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+
+          # Upstream SDL2_image/Ogg/Vorbis/Theora DLLs import VCRUNTIME140.dll.
+          # Include Microsoft's signed x64 redistributable DLL so the package is
+          # self-contained and does not ask the user to download an arbitrary DLL.
+          $redistRoot = Join-Path $vs 'VC\Redist\MSVC'
+          $vcRuntime = Get-ChildItem -LiteralPath $redistRoot -Recurse -Filter VCRUNTIME140.dll -File |
+            Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC\d+\.CRT\\VCRUNTIME140\.dll$' -and $_.FullName -notmatch '\\onecore\\' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $vcRuntime) { throw "Signed x64 VCRUNTIME140.dll was not found below $redistRoot" }
+          $signature = Get-AuthenticodeSignature -LiteralPath $vcRuntime.FullName
+          if ($signature.Status -ne 'Valid') { throw "VCRUNTIME140.dll signature is not valid: $($signature.Status)" }
+          if ($signature.SignerCertificate.Subject -notmatch 'Microsoft') { throw 'VCRUNTIME140.dll is not signed by Microsoft.' }
+          Copy-Item $vcRuntime.FullName artifact\VCRUNTIME140.dll
+          @(
+            "Source: $($vcRuntime.FullName)",
+            "SHA-256: $((Get-FileHash $vcRuntime.FullName -Algorithm SHA256).Hash.ToLowerInvariant())",
+            "Signature status: $($signature.Status)",
+            "Signer: $($signature.SignerCertificate.Subject)"
+          ) | Set-Content artifact\VCRUNTIME140-PROVENANCE.txt -Encoding UTF8
+
           $command = 'call "' + $vcvars + '" && dumpbin.exe /headers artifact\theforceengine.exe > artifact\PE-HEADERS.txt && dumpbin.exe /dependents artifact\theforceengine.exe > artifact\DEPENDENCIES.txt'
           & cmd.exe /d /s /c $command
           if ($LASTEXITCODE -ne 0) { throw 'dumpbin validation failed.' }
 
+          Set-Content artifact\MULTIMEDIA-DLL-DEPENDENCIES.txt 'Bundled multimedia DLL dependency reports' -Encoding UTF8
+          foreach ($dll in @('SDL2.dll','SDL2_image.dll','ogg.dll','theora.dll','vorbis.dll','VCRUNTIME140.dll')) {
+            Add-Content artifact\MULTIMEDIA-DLL-DEPENDENCIES.txt "`r`n===== $dll ====="
+            $dllCommand = 'call "' + $vcvars + '" && dumpbin.exe /dependents "artifact\' + $dll + '" >> artifact\MULTIMEDIA-DLL-DEPENDENCIES.txt'
+            & cmd.exe /d /s /c $dllCommand
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $dll" }
+          }
+
           $deps = Get-Content artifact\DEPENDENCIES.txt -Raw
           foreach ($forbidden in @('libunwind.dll','libc++.dll','VCRUNTIME140.dll','VCRUNTIME140_1.dll','MSVCP140.dll','MSVCP140_1.dll','MSVCP140_2.dll')) {
-            if ($deps -match [regex]::Escape($forbidden)) { throw "Forbidden runtime dependency remains: $forbidden" }
+            if ($deps -match [regex]::Escape($forbidden)) { throw "Forbidden direct engine runtime dependency remains: $forbidden" }
           }
+          $allDllDeps = Get-Content artifact\MULTIMEDIA-DLL-DEPENDENCIES.txt -Raw
+          foreach ($forbidden in @('libunwind.dll','libc++.dll','libgcc_s_seh-1.dll','libstdc++-6.dll')) {
+            if ($allDllDeps -match [regex]::Escape($forbidden)) { throw "Forbidden LLVM/MinGW dependency remains in a bundled DLL: $forbidden" }
+          }
+          if ($allDllDeps -notmatch 'VCRUNTIME140\.dll') { throw 'Bundled DLL dependency report did not expose the expected VCRUNTIME140 dependency.' }
+
           $headers = Get-Content artifact\PE-HEADERS.txt -Raw
           if ($headers -notmatch 'machine \(x64\)') { throw 'The resulting executable is not x64.' }
 
@@ -141,12 +176,13 @@ jobs:
             ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), [IO.Path]::GetFileName($_.Path) } |
             Set-Content artifact\SHA256SUMS.txt -Encoding Ascii
           Get-Content artifact\DEPENDENCIES.txt
+          Get-Content artifact\VCRUNTIME140-PROVENANCE.txt
           Get-Content artifact\SHA256SUMS.txt
 
       - name: Upload native engine artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TFE-Coop-Milestone-4.1.7-MSVC-x64
+          name: TFE-Coop-Milestone-4.1.7-MSVC-x64-self-contained
           path: artifact/
           if-no-files-found: error
           retention-days: 7

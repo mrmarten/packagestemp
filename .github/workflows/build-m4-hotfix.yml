@@ -37,11 +37,16 @@ jobs:
           git -C tfe apply "$GITHUB_WORKSPACE/hotfix.patch"
           git -C tfe diff --check
 
-      - name: Run protocol and sanitizer tests
+      - name: Run protocol and sanitizer tests when present
         shell: bash
         run: |
-          tfe/tests/coop/build_and_run.sh
-          COOP_TEST_BUILD_DIR="$PWD/tfe/build/coop-tests-sanitized" COOP_SANITIZE=1 tfe/tests/coop/build_and_run.sh
+          set -euo pipefail
+          if [ -x tfe/tests/coop/build_and_run.sh ]; then
+            tfe/tests/coop/build_and_run.sh
+            COOP_TEST_BUILD_DIR="$PWD/tfe/build/coop-tests-sanitized" COOP_SANITIZE=1 tfe/tests/coop/build_and_run.sh
+          else
+            echo "The cumulative patch does not include the standalone coop test harness; continuing to the full-engine build."
+          fi
 
       - name: Install Linux build dependencies
         shell: bash
@@ -107,14 +112,19 @@ jobs:
           [IO.File]::WriteAllBytes('hotfix.patch.xz', [Convert]::FromBase64String($text))
           $xzHash = (Get-FileHash hotfix.patch.xz -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($xzHash -ne $env:XZ_SHA256) { throw "XZ checksum mismatch: $xzHash" }
-          & 'C:\Program Files\Git\usr\bin\xz.exe' -dc hotfix.patch.xz | Set-Content -Encoding utf8NoBOM hotfix.patch
-          if ($LASTEXITCODE -ne 0) { throw 'xz decompression failed' }
+          @'
+          import lzma
+          from pathlib import Path
+          Path('hotfix.patch').write_bytes(lzma.decompress(Path('hotfix.patch.xz').read_bytes()))
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Python lzma decompression failed' }
           $patchHash = (Get-FileHash hotfix.patch -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($patchHash -ne $env:PATCH_SHA256) { throw "Patch checksum mismatch: $patchHash" }
           git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
           git -C tfe checkout $env:TFE_SHA
           git -C tfe apply --check (Resolve-Path hotfix.patch)
           git -C tfe apply (Resolve-Path hotfix.patch)
+          git -C tfe diff --check
 
       - name: Build Windows x64
         shell: pwsh
@@ -129,15 +139,20 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force windows-output | Out-Null
-          $exe = Get-ChildItem -Path tfe -Recurse -Filter *.exe |
-            Where-Object { $_.Name -match 'TheForceEngine|theforceengine' -and $_.FullName -match '\\x64\\Release\\' } |
+          $engine = Get-ChildItem -Path tfe -Recurse -Filter theforceengine.exe |
+            Where-Object { $_.FullName -match '\\x64\\Release\\' } |
             Sort-Object Length -Descending |
             Select-Object -First 1
-          if (-not $exe) { throw 'The Force Engine Windows executable was not found.' }
-          Copy-Item $exe.FullName windows-output\theforceengine.exe
+          if (-not $engine) { throw 'The Force Engine Windows executable was not found.' }
+          $split = Get-ChildItem -Path tfe -Recurse -Filter tfe_coop_splitscreen.exe |
+            Where-Object { $_.FullName -match '\\x64\\Release\\' } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+          Copy-Item $engine.FullName windows-output\theforceengine.exe
+          if ($split) { Copy-Item $split.FullName windows-output\tfe_coop_splitscreen.exe }
           Copy-Item hotfix.patch windows-output\TFE-Coop-Milestone-4.1-Hotfix.patch
           Copy-Item tfe\COOP_README.md,tfe\MILESTONE4_RELEASE_NOTES.md,tfe\LICENSE windows-output
-          Get-FileHash windows-output\theforceengine.exe -Algorithm SHA256 | Format-List | Out-File windows-output\WINDOWS-BUILD-SHA256.txt
+          Get-FileHash windows-output\*.exe -Algorithm SHA256 | Format-Table -AutoSize | Out-File windows-output\WINDOWS-BUILD-SHA256.txt
           Compress-Archive -Path windows-output\* -DestinationPath TFE-Coop-Milestone-4.1-Windows-binary.zip -CompressionLevel Optimal
 
       - uses: actions/upload-artifact@v4

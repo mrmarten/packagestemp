@@ -1,0 +1,79 @@
+name: Test exact TFE Co-op M4.1.7 launcher
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode and checksum the exact launcher
+        shell: pwsh
+        run: |
+          $encoded = (Get-Content m417-launcher/Start-TFE-Coop-Local.ps1.xz.b64 -Raw) -replace '\s',''
+          [IO.File]::WriteAllBytes('launcher.xz', [Convert]::FromBase64String($encoded))
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          source = lzma.decompress(Path('launcher.xz').read_bytes())
+          expected = 'eb0afd104463d3e5e5fa88d4396088f0bd170960eb37f16d031e6ade1382c278'
+          actual = hashlib.sha256(source).hexdigest()
+          if actual != expected:
+              raise SystemExit(f'launcher checksum mismatch: {actual}')
+          Path('Start-TFE-Coop-Local.ps1').write_bytes(source)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher decode/checksum failed.' }
+          New-Item -ItemType File -Path .\theforceengine.exe -Force | Out-Null
+
+      - name: Parse with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\Start-TFE-Coop-Local.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Force
+            throw 'Windows PowerShell 5.1 parser reported launcher errors.'
+          }
+          $text = Get-Content .\Start-TFE-Coop-Local.ps1 -Raw
+          foreach ($forbidden in @('$controllerProfile:', '$splitExe', 'Static MSVC supervisor active')) {
+            if ($text.Contains($forbidden)) { throw "Forbidden launcher regression remains: $forbidden" }
+          }
+          foreach ($required in @('${controllerProfile}:','Assert-ProcessAlive','Wait-ForMainWindowHandle','[IntPtr]::Zero','Start-Process -FilePath $engineExe')) {
+            if (-not $text.Contains($required)) { throw "Required launcher safeguard is absent: $required" }
+          }
+          Write-Host 'Windows PowerShell 5.1 parse: PASS'
+
+      - name: Execute every non-launching geometry and input preflight
+        shell: powershell
+        run: |
+          foreach ($layout in @('Vertical','Horizontal')) {
+            foreach ($mode in @('KeyboardController','ControllerKeyboard','TwoControllers')) {
+              $output = & .\Start-TFE-Coop-Local.ps1 -Layout $layout -InputMode $mode -PreflightOnly
+              if ($LASTEXITCODE -ne 0) { throw "Preflight failed: $layout / $mode" }
+              $json = $output | Where-Object { "$_" -match '^\{.*\}$' } | Select-Object -Last 1
+              if (-not $json) { throw "No preflight JSON: $layout / $mode" }
+              $data = $json | ConvertFrom-Json
+              foreach ($field in @('WorkArea','HostRectangle','ClientRectangle')) {
+                if ($data.$field -notmatch '^-?\d+,-?\d+,\d+,\d+$') {
+                  throw "Invalid $field for $layout / $mode: $($data.$field)"
+                }
+              }
+              if ($data.HostArguments -notmatch '--coop-host') { throw 'Host arguments lack --coop-host.' }
+              if ($data.ClientArguments -notmatch '--coop-connect 127\.0\.0\.1') { throw 'Client arguments lack localhost connection.' }
+              if ($mode -eq 'KeyboardController' -and ([int]$data.HostController -ne 31 -or [int]$data.ClientController -ne 0)) {
+                throw 'Keyboard/controller assignment is wrong.'
+              }
+            }
+          }
+          Write-Host 'All layout/input preflight paths: PASS'

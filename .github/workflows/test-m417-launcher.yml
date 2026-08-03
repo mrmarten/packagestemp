@@ -22,14 +22,17 @@ jobs:
         run: |
           $launcherEncoded = (Get-Content m417-launcher/Start-TFE-Coop-Local.ps1.xz.b64 -Raw) -replace '\s',''
           $verifierEncoded = (Get-Content m417-launcher/VERIFY-WINDOWS.ps1.xz.b64 -Raw) -replace '\s',''
+          $applyEncoded = (Get-Content m417-launcher/APPLY-MILESTONE-4.1.7-NATIVE-MSVC-HOTFIX.ps1.xz.b64 -Raw) -replace '\s',''
           [IO.File]::WriteAllBytes('launcher.xz', [Convert]::FromBase64String($launcherEncoded))
           [IO.File]::WriteAllBytes('verifier.xz', [Convert]::FromBase64String($verifierEncoded))
+          [IO.File]::WriteAllBytes('apply.xz', [Convert]::FromBase64String($applyEncoded))
           @'
           import hashlib, lzma
           from pathlib import Path
           items = [
               ('launcher.xz', 'Start-TFE-Coop-Local.ps1', 'eb0afd104463d3e5e5fa88d4396088f0bd170960eb37f16d031e6ade1382c278'),
               ('verifier.xz', 'VERIFY-WINDOWS.ps1', 'be62dd6081994387415fcd2943985ea14923a746739d31fbef7a62b9a3ea5779'),
+              ('apply.xz', 'APPLY-MILESTONE-4.1.7-NATIVE-MSVC-HOTFIX.ps1', '891a292ab337749d626eac5636f8956678409c06361370e02ac60b2eb5b52551'),
           ]
           for compressed_name, output_name, expected in items:
               source = lzma.decompress(Path(compressed_name).read_bytes())
@@ -41,10 +44,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Script decode/checksum failed.' }
           New-Item -ItemType File -Path .\theforceengine.exe -Force | Out-Null
 
-      - name: Parse exact launcher and verifier with Windows PowerShell 5.1
+      - name: Parse exact scripts with Windows PowerShell 5.1
         shell: powershell
         run: |
-          foreach ($script in @('.\Start-TFE-Coop-Local.ps1','.\VERIFY-WINDOWS.ps1')) {
+          foreach ($script in @(
+            '.\Start-TFE-Coop-Local.ps1',
+            '.\VERIFY-WINDOWS.ps1',
+            '.\APPLY-MILESTONE-4.1.7-NATIVE-MSVC-HOTFIX.ps1'
+          )) {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile(
@@ -94,7 +101,7 @@ jobs:
           }
           Write-Host 'All layout/input preflight paths: PASS'
 
-      - name: Execute the exact verifier against the native self-contained artifact
+      - name: Execute the exact drop-in apply script and verifier against the native artifact
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
@@ -109,6 +116,7 @@ jobs:
           Move-Item verify-package\SHA256SUMS.txt verify-package\NATIVE-MSVC-ARTIFACT-SHA256SUMS.txt
           Copy-Item .\Start-TFE-Coop-Local.ps1 verify-package\Start-TFE-Coop-Local.ps1
           Copy-Item .\VERIFY-WINDOWS.ps1 verify-package\VERIFY-WINDOWS.ps1
+          Copy-Item .\APPLY-MILESTONE-4.1.7-NATIVE-MSVC-HOTFIX.ps1 verify-package\APPLY-MILESTONE-4.1.7-NATIVE-MSVC-HOTFIX.ps1
 
           foreach ($name in @(
             'Host-Coop.bat','Join-Coop.bat','Start-Local-SplitScreen-Keyboard-Controller.bat',
@@ -119,15 +127,19 @@ jobs:
             Set-Content -LiteralPath (Join-Path verify-package $name) -Value 'CI package-verifier fixture' -Encoding Ascii
           }
 
-          Get-ChildItem -LiteralPath verify-package -Recurse -File |
-            Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
-            Sort-Object FullName |
-            ForEach-Object {
-              $relative = $_.FullName.Substring((Resolve-Path verify-package).Path.Length + 1).Replace('\\','/')
-              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-              "${hash}  ${relative}"
-            } | Set-Content verify-package\SHA256SUMS.txt -Encoding Ascii
+          # Simulate an old installation receiving the drop-in replacement.
+          Set-Content verify-package\libc++.dll 'legacy' -Encoding Ascii
+          Set-Content verify-package\libunwind.dll 'legacy' -Encoding Ascii
+          Set-Content verify-package\tfe_coop_splitscreen.exe 'legacy' -Encoding Ascii
 
-          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File verify-package\VERIFY-WINDOWS.ps1
-          if ($LASTEXITCODE -ne 0) { throw "Exact package verifier returned $LASTEXITCODE." }
-          Write-Host 'Exact self-contained package verifier execution: PASS'
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File verify-package\APPLY-MILESTONE-4.1.7-NATIVE-MSVC-HOTFIX.ps1 `
+            -PackageDir verify-package
+          if ($LASTEXITCODE -ne 0) { throw "Exact drop-in apply script returned $LASTEXITCODE." }
+
+          foreach ($legacy in @('libc++.dll','libunwind.dll','tfe_coop_splitscreen.exe')) {
+            if (Test-Path -LiteralPath (Join-Path verify-package $legacy)) {
+              throw "Drop-in apply script did not remove $legacy"
+            }
+          }
+          Write-Host 'Exact drop-in apply script and self-contained verifier: PASS'

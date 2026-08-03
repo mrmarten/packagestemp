@@ -9,27 +9,39 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
-      - name: Decode launcher
+      - name: Decode exact launcher and verifier
         shell: pwsh
         run: |
-          $encoded = (Get-Content m416/Start-TFE-Coop-Local.ps1.xz.b64 -Raw) -replace '\s',''
-          [IO.File]::WriteAllBytes('launcher.xz', [Convert]::FromBase64String($encoded))
           @'
-          import hashlib, lzma
+          import base64, hashlib, lzma
           from pathlib import Path
-          source = lzma.decompress(Path('launcher.xz').read_bytes())
-          Path('Start-TFE-Coop-Local.ps1').write_bytes(source)
-          assert hashlib.sha256(source).hexdigest() == '437ace00907fe70176abada499572712935beaf910e636db95cd4659878994a9'
+          items = [
+              ('m416/Start-TFE-Coop-Local.ps1.xz.b64', 'Start-TFE-Coop-Local.ps1', '437ace00907fe70176abada499572712935beaf910e636db95cd4659878994a9'),
+              ('m416/VERIFY-WINDOWS.ps1.xz.b64', 'VERIFY-WINDOWS.ps1', '586f7d0a3befcf387b73a14938700752ab29a934ca5007ebcc4dd952284c656a'),
+          ]
+          for encoded_path, output_path, expected in items:
+              compact = ''.join(Path(encoded_path).read_text(encoding='utf-8').split())
+              source = lzma.decompress(base64.b64decode(compact, validate=True))
+              digest = hashlib.sha256(source).hexdigest()
+              if digest != expected:
+                  raise SystemExit(f'{output_path} checksum mismatch: {digest}')
+              Path(output_path).write_bytes(source)
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw 'Decode failed' }
-          New-Item -ItemType File -Path .\theforceengine.exe -Force | Out-Null
-      - name: Parse and execute preflight
+          foreach ($name in @(
+            'theforceengine.exe','SDL2.dll','SDL2_image.dll','libc++.dll','libunwind.dll',
+            'Host-Coop.bat','Join-Coop.bat','Start-Local-SplitScreen-Keyboard-Controller.bat',
+            'Repair-TFE-Coop-Profiles.ps1','Repair-TFE-Coop-Profiles.bat','MILESTONE4_1_6_GEOMETRY_FIX.txt'
+          )) {
+            New-Item -ItemType File -Path (Join-Path $PWD $name) -Force | Out-Null
+          }
+      - name: Parse and execute exact launcher preflight
         shell: powershell
         run: |
           $tokens = $null
           $errors = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\Start-TFE-Coop-Local.ps1), [ref]$tokens, [ref]$errors)
-          if ($errors.Count -gt 0) { throw 'Parser errors' }
+          if ($errors.Count -gt 0) { throw 'Launcher parser errors' }
           foreach ($layout in @('Vertical','Horizontal')) {
             foreach ($mode in @('KeyboardController','ControllerKeyboard','TwoControllers')) {
               $result = & .\Start-TFE-Coop-Local.ps1 -Layout $layout -InputMode $mode -PreflightOnly
@@ -41,9 +53,17 @@ jobs:
             }
           }
           Write-Host 'PowerShell 5.1 parse and geometry execution: PASS'
+      - name: Execute exact package verifier
+        shell: powershell
+        run: |
+          & .\VERIFY-WINDOWS.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Verifier failed with exit code $LASTEXITCODE" }
+          Write-Host 'Exact package verifier execution: PASS'
       - uses: actions/upload-artifact@v4
         with:
-          name: TFE-Coop-Milestone-4.1.6-Launcher
-          path: Start-TFE-Coop-Local.ps1
+          name: TFE-Coop-Milestone-4.1.6-Validated-Scripts
+          path: |
+            Start-TFE-Coop-Local.ps1
+            VERIFY-WINDOWS.ps1
           if-no-files-found: error
           retention-days: 7

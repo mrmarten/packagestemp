@@ -7,34 +7,46 @@ on:
 permissions:
   contents: read
 
-env:
-  B64_SHA256: 5776428a7e95b65fe6f1e6b07de20804b52fdca392ed101e11f634c850315ebf
-  XZ_SHA256: 90153819419367b0370692b3f5baa248589c4014028735443be44d14c3b5cb73
-  PATCH_SHA256: 30bef404bff1fac4cab737a71e33760888fcfd959b6a19a40588a39c72123951
-
 jobs:
   decode:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Reconstruct compressed patch
+      - name: Decode every candidate patch bundle
         shell: bash
         run: |
           set -euo pipefail
-          cat patches/m4-hotfix-v2/part-*.txt > m4-hotfix.patch.xz.b64
-          test "$(sha256sum m4-hotfix.patch.xz.b64 | awk '{print $1}')" = "$B64_SHA256"
-          base64 --decode m4-hotfix.patch.xz.b64 > m4-hotfix.patch.xz
-          test "$(sha256sum m4-hotfix.patch.xz | awk '{print $1}')" = "$XZ_SHA256"
-          xz -t m4-hotfix.patch.xz
-          xz --decompress --stdout m4-hotfix.patch.xz > m4-hotfix.patch
-          test "$(sha256sum m4-hotfix.patch | awk '{print $1}')" = "$PATCH_SHA256"
-          sha256sum m4-hotfix.patch.xz.b64 m4-hotfix.patch.xz m4-hotfix.patch > SHA256SUMS.txt
-          head -60 m4-hotfix.patch
+          python3 - <<'PY'
+          import base64, hashlib, lzma
+          from pathlib import Path
+
+          out = Path('decoded')
+          out.mkdir()
+          manifest = []
+          for src in sorted(Path('patches').glob('m4-hotfix*')):
+              parts = sorted(src.glob('part-*.txt'))
+              if not parts:
+                  continue
+              raw_text = ''.join(p.read_text(encoding='utf-8') for p in parts)
+              compact = ''.join(raw_text.split())
+              prefix = src.name
+              b64_path = out / f'{prefix}.patch.xz.b64'
+              xz_path = out / f'{prefix}.patch.xz'
+              patch_path = out / f'{prefix}.patch'
+              b64_path.write_text(compact, encoding='ascii')
+              compressed = base64.b64decode(compact, validate=True)
+              xz_path.write_bytes(compressed)
+              patch = lzma.decompress(compressed)
+              patch_path.write_bytes(patch)
+              for p in (b64_path, xz_path, patch_path):
+                  manifest.append(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p}")
+              print(prefix, 'parts=', len(parts), 'patch-bytes=', len(patch))
+              print(patch[:120].decode('utf-8', errors='replace'))
+          (out / 'SHA256SUMS.txt').write_text('\n'.join(manifest) + '\n', encoding='ascii')
+          PY
       - uses: actions/upload-artifact@v4
         with:
-          name: decoded-m4-hotfix-patch
-          path: |
-            m4-hotfix.patch
-            SHA256SUMS.txt
+          name: decoded-m4-hotfix-candidates
+          path: decoded/
           if-no-files-found: error
           retention-days: 1

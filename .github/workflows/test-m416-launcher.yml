@@ -1,0 +1,49 @@
+name: Test TFE Co-op 4.1.6 launcher
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decode launcher
+        shell: pwsh
+        run: |
+          $encoded = (Get-Content m416/Start-TFE-Coop-Local.ps1.xz.b64 -Raw) -replace '\s',''
+          [IO.File]::WriteAllBytes('launcher.xz', [Convert]::FromBase64String($encoded))
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          source = lzma.decompress(Path('launcher.xz').read_bytes())
+          Path('Start-TFE-Coop-Local.ps1').write_bytes(source)
+          assert hashlib.sha256(source).hexdigest() == '437ace00907fe70176abada499572712935beaf910e636db95cd4659878994a9'
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Decode failed' }
+          New-Item -ItemType File -Path .\theforceengine.exe -Force | Out-Null
+      - name: Parse and execute preflight
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\Start-TFE-Coop-Local.ps1), [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { throw 'Parser errors' }
+          foreach ($layout in @('Vertical','Horizontal')) {
+            foreach ($mode in @('KeyboardController','ControllerKeyboard','TwoControllers')) {
+              $result = & .\Start-TFE-Coop-Local.ps1 -Layout $layout -InputMode $mode -PreflightOnly
+              $json = $result | Where-Object { "$_" -match '^\{.*\}$' } | Select-Object -Last 1
+              if (-not $json) { throw "No JSON for $layout/$mode" }
+              $data = $json | ConvertFrom-Json
+              if ($data.HostRectangle -notmatch '^-?\d+,-?\d+,\d+,\d+$') { throw 'Bad host rectangle' }
+              if ($data.ClientRectangle -notmatch '^-?\d+,-?\d+,\d+,\d+$') { throw 'Bad client rectangle' }
+            }
+          }
+          Write-Host 'PowerShell 5.1 parse and geometry execution: PASS'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-4.1.6-Launcher
+          path: Start-TFE-Coop-Local.ps1
+          if-no-files-found: error
+          retention-days: 7

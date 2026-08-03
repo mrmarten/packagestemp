@@ -1,0 +1,71 @@
+name: Build static MSVC TFE co-op supervisor
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode exact source
+        shell: pwsh
+        run: |
+          $encoded = (Get-Content m42-supervisor/coop_splitscreen_win.cpp.xz.b64 -Raw) -replace '\s',''
+          [IO.File]::WriteAllBytes('supervisor-source.xz', [Convert]::FromBase64String($encoded))
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          source = lzma.decompress(Path('supervisor-source.xz').read_bytes())
+          Path('coop_splitscreen_win.cpp').write_bytes(source)
+          digest = hashlib.sha256(source).hexdigest()
+          if digest != 'b7eccd3906fb9a6682b16e2b65ccdd4fe3d66fc95e86c0ebc3ea1d97e8c6ca0d':
+              raise SystemExit(f'source checksum mismatch: {digest}')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Source decode failed.' }
+
+      - name: Build static x64 supervisor with MSVC
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+          if ([string]::IsNullOrWhiteSpace($vs)) { throw 'Visual Studio C++ toolchain was not found.' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path -LiteralPath $vcvars -PathType Leaf)) { throw "vcvars64.bat missing: $vcvars" }
+          $command = 'call "' + $vcvars + '" && cl.exe /nologo /std:c++17 /EHsc /O2 /MT /W4 /DUNICODE /D_UNICODE coop_splitscreen_win.cpp /link /SUBSYSTEM:CONSOLE /OUT:tfe_coop_splitscreen_msvc.exe shell32.lib user32.lib'
+          & cmd.exe /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw "MSVC build failed with exit code $LASTEXITCODE" }
+
+      - name: Validate dependencies and execute help path
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $command = 'call "' + $vcvars + '" && dumpbin.exe /dependents tfe_coop_splitscreen_msvc.exe > supervisor-dependencies.txt'
+          & cmd.exe /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw 'dumpbin failed.' }
+          $deps = Get-Content supervisor-dependencies.txt -Raw
+          foreach ($forbidden in @('libunwind.dll','libc++.dll','VCRUNTIME140.dll','MSVCP140.dll')) {
+            if ($deps -match [regex]::Escape($forbidden)) { throw "Unexpected dynamic runtime dependency: $forbidden" }
+          }
+          & .\tfe_coop_splitscreen_msvc.exe --help
+          if ($LASTEXITCODE -ne 2) { throw "Unexpected --help exit code: $LASTEXITCODE" }
+          Get-FileHash .\tfe_coop_splitscreen_msvc.exe -Algorithm SHA256 | Format-List | Out-File supervisor-sha256.txt
+          Get-Content supervisor-dependencies.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Static-Msvc-Supervisor
+          path: |
+            tfe_coop_splitscreen_msvc.exe
+            supervisor-dependencies.txt
+            supervisor-sha256.txt
+            coop_splitscreen_win.cpp
+          if-no-files-found: error
+          retention-days: 7

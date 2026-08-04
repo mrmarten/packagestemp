@@ -1,4 +1,4 @@
-name: Validate TFE Co-op M4.1.8 launcher
+name: Validate TFE Co-op M4.1.8 launcher and package verifier
 
 on:
   pull_request:
@@ -6,6 +6,11 @@ on:
 
 permissions:
   contents: read
+  actions: read
+
+env:
+  ENGINE_BUILD_RUN_ID: 30884905234
+  ENGINE_ARTIFACT_NAME: TFE-Coop-Milestone-4.1.8-MSVC-x64-self-contained
 
 jobs:
   windows-powershell-51:
@@ -13,54 +18,64 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Decode exact launcher
+      - name: Decode exact launcher, verifier, and profile repair script
         shell: pwsh
         run: |
-          $encoded = (Get-Content m418-launcher/Start-TFE-Coop-Local.ps1.xz.b64 -Raw) -replace '\s',''
-          [IO.File]::WriteAllBytes('launcher.xz', [Convert]::FromBase64String($encoded))
+          $items = @(
+            @{ Encoded = 'm418-launcher/Start-TFE-Coop-Local.ps1.xz.b64'; Compressed = 'launcher.xz'; Output = 'Start-TFE-Coop-Local.ps1'; Hash = 'c2c1addc78c3f5a1e5ac56755a95c9445261ce318ca97019f7de0621cce5a222' },
+            @{ Encoded = 'm418-launcher/VERIFY-WINDOWS.ps1.xz.b64'; Compressed = 'verifier.xz'; Output = 'VERIFY-WINDOWS.ps1'; Hash = 'f360230b2f113e269dd9df92d083e8277d9c7a51222dff023cf4d4da765ec3b4' },
+            @{ Encoded = 'm418-launcher/Repair-TFE-Coop-Profiles.ps1.xz.b64'; Compressed = 'repair.xz'; Output = 'Repair-TFE-Coop-Profiles.ps1'; Hash = 'a3b03857696a6c61fa27ef6c8a281318735f7238baebf2aa6894cab7fc883263' }
+          )
+          foreach ($item in $items) {
+            $encoded = (Get-Content $item.Encoded -Raw) -replace '\s',''
+            [IO.File]::WriteAllBytes($item.Compressed, [Convert]::FromBase64String($encoded))
+          }
           @'
           import hashlib, lzma
           from pathlib import Path
-          source = lzma.decompress(Path('launcher.xz').read_bytes())
-          expected = 'c2c1addc78c3f5a1e5ac56755a95c9445261ce318ca97019f7de0621cce5a222'
-          actual = hashlib.sha256(source).hexdigest()
-          if actual != expected:
-              raise SystemExit(f'launcher checksum mismatch: {actual}')
-          Path('Start-TFE-Coop-Local.ps1').write_bytes(source)
+          items = [
+              ('launcher.xz', 'Start-TFE-Coop-Local.ps1', 'c2c1addc78c3f5a1e5ac56755a95c9445261ce318ca97019f7de0621cce5a222'),
+              ('verifier.xz', 'VERIFY-WINDOWS.ps1', 'f360230b2f113e269dd9df92d083e8277d9c7a51222dff023cf4d4da765ec3b4'),
+              ('repair.xz', 'Repair-TFE-Coop-Profiles.ps1', 'a3b03857696a6c61fa27ef6c8a281318735f7238baebf2aa6894cab7fc883263'),
+          ]
+          for compressed, output, expected in items:
+              source = lzma.decompress(Path(compressed).read_bytes())
+              actual = hashlib.sha256(source).hexdigest()
+              if actual != expected:
+                  raise SystemExit(f'{output} checksum mismatch: {actual}')
+              Path(output).write_bytes(source)
           '@ | python -
-          if ($LASTEXITCODE -ne 0) { throw 'Launcher decode/checksum failed.' }
-          New-Item -ItemType File -Path .\theforceengine.exe -Force | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Script decode/checksum failed.' }
 
-      - name: Parse with Windows PowerShell 5.1
+      - name: Parse exact scripts with Windows PowerShell 5.1
         shell: powershell
         run: |
-          $tokens = $null
-          $errors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path .\Start-TFE-Coop-Local.ps1),
-            [ref]$tokens,
-            [ref]$errors
-          )
-          if ($errors.Count -gt 0) {
-            $errors | Format-List -Force
-            throw 'Windows PowerShell 5.1 parser reported launcher errors.'
+          foreach ($script in @('.\Start-TFE-Coop-Local.ps1','.\VERIFY-WINDOWS.ps1','.\Repair-TFE-Coop-Profiles.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script),[ref]$tokens,[ref]$errors)
+            if ($errors.Count -gt 0) {
+              $errors | Format-List -Force
+              throw "Windows PowerShell 5.1 parser reported errors in $script."
+            }
           }
           $text = Get-Content .\Start-TFE-Coop-Local.ps1 -Raw
-          foreach ($forbidden in @('$controllerProfile:', '$splitExe', 'Static MSVC supervisor active', '--window-rect')) {
+          foreach ($forbidden in @('$controllerProfile:','$splitExe','Static MSVC supervisor active','--window-rect')) {
             if ($text.Contains($forbidden)) { throw "Forbidden launcher regression remains: $forbidden" }
           }
           foreach ($required in @(
             'Assert-ProcessAlive','Wait-ForMainWindowHandle','[IntPtr]::Zero',
             'Start-Process -FilePath $engineExe','--split-window','--split-display',
-            '--controller-ui-only','Set-ConsoleVisibility','Wait-ForControllerOpen'
+            '--controller-ui-only','--disable-controller','Set-ConsoleVisibility','Wait-ForControllerOpen'
           )) {
             if (-not $text.Contains($required)) { throw "Required launcher safeguard is absent: $required" }
           }
-          Write-Host 'Windows PowerShell 5.1 parse: PASS'
+          Write-Host 'Windows PowerShell 5.1 parsing: PASS'
 
       - name: Execute every layout and input preflight
         shell: powershell
         run: |
+          New-Item -ItemType File -Path .\theforceengine.exe -Force | Out-Null
           foreach ($layout in @('Vertical','Horizontal')) {
             foreach ($mode in @('KeyboardController','ControllerKeyboard','TwoControllers')) {
               $output = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
@@ -72,40 +87,87 @@ jobs:
               $json = $output | Where-Object { "$_" -match '^\{.*\}$' } | Select-Object -Last 1
               if (-not $json) { throw "No JSON for $layout / $mode" }
               $data = $json | ConvertFrom-Json
-              if ($data.Version -ne '4.1.8') { throw 'Unexpected launcher version.' }
-              if ($data.Layout -ne $layout -or $data.InputMode -ne $mode) { throw 'Preflight metadata mismatch.' }
-
+              if ($data.Version -ne '4.1.8' -or $data.Layout -ne $layout -or $data.InputMode -ne $mode) { throw 'Preflight metadata mismatch.' }
               $layoutToken = $layout.ToLowerInvariant()
               if ($data.HostArguments -notmatch "--split-window $layoutToken 0") { throw 'Host split-window arguments are wrong.' }
               if ($data.ClientArguments -notmatch "--split-window $layoutToken 1") { throw 'Client split-window arguments are wrong.' }
               if ($data.HostArguments -notmatch '--split-display 0' -or $data.ClientArguments -notmatch '--split-display 0') { throw 'Display arguments are missing.' }
               if ($data.HostArguments -notmatch '--coop-host' -or $data.ClientArguments -notmatch '--coop-connect 127\.0\.0\.1') { throw 'Network arguments are wrong.' }
-
               if ($mode -eq 'KeyboardController') {
                 if ([int]$data.HostController -ne 0 -or [int]$data.ClientController -ne 0) { throw 'Mirrored controller indices are wrong.' }
-                if (-not [bool]$data.HostControllerUiOnly) { throw 'Host UI-only controller mode is missing.' }
-                if ($data.HostArguments -notmatch '--controller-ui-only') { throw 'Host UI-only argument is missing.' }
+                if (-not [bool]$data.HostControllerUiOnly -or $data.HostArguments -notmatch '--controller-ui-only') { throw 'Host UI-only controller mode is missing.' }
               }
               if ($mode -eq 'ControllerKeyboard' -and $data.ClientArguments -notmatch '--disable-controller') { throw 'Keyboard Client controller disable is missing.' }
               if ($mode -eq 'TwoControllers' -and ([int]$data.HostController -ne 0 -or [int]$data.ClientController -ne 1)) { throw 'Two-controller indices are wrong.' }
             }
           }
+          Remove-Item .\theforceengine.exe -Force
           Write-Host 'Vertical left/right and horizontal top/bottom preflights: PASS'
 
-      - name: Validate release BAT aliases
+      - name: Build exact verifier fixture from the native artifact
         shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          @{
+          New-Item -ItemType Directory -Path fixture -Force | Out-Null
+          gh run download $env:ENGINE_BUILD_RUN_ID --repo $env:GITHUB_REPOSITORY --name $env:ENGINE_ARTIFACT_NAME --dir fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download the native engine artifact.' }
+
+          Move-Item fixture\DEPENDENCIES.txt fixture\NATIVE-MSVC-DEPENDENCIES.txt
+          Move-Item fixture\PE-HEADERS.txt fixture\NATIVE-MSVC-PE-HEADERS.txt
+          Move-Item fixture\SHA256SUMS.txt fixture\NATIVE-MSVC-ARTIFACT-SHA256SUMS.txt
+          Move-Item fixture\BUILD-INFO.txt fixture\ENGINE-BUILD-INFO.txt
+          Copy-Item .\Start-TFE-Coop-Local.ps1 fixture\Start-TFE-Coop-Local.ps1
+          Copy-Item .\VERIFY-WINDOWS.ps1 fixture\VERIFY-WINDOWS.ps1
+          Copy-Item .\Repair-TFE-Coop-Profiles.ps1 fixture\Repair-TFE-Coop-Profiles.ps1
+
+          $batMap = @{
             'Start-Local-SplitScreen-Keyboard-Controller.bat' = '-Layout Vertical -InputMode KeyboardController';
             'Start-Local-SplitScreen-Keyboard-Controller-TopBottom.bat' = '-Layout Horizontal -InputMode KeyboardController';
-            'Start-Local-SplitScreen-Two-Controllers.bat' = '-Layout Vertical -InputMode TwoControllers';
-            'Start-Local-SplitScreen-Two-Controllers-TopBottom.bat' = '-Layout Horizontal -InputMode TwoControllers';
             'Start-Local-SplitScreen-Controller-Keyboard.bat' = '-Layout Vertical -InputMode ControllerKeyboard';
             'Start-Local-SplitScreen-Controller-Keyboard-TopBottom.bat' = '-Layout Horizontal -InputMode ControllerKeyboard';
-          }.GetEnumerator() | ForEach-Object {
-            $content = "@echo off`r`nsetlocal`r`npowershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File `"%~dp0Start-TFE-Coop-Local.ps1`" $($_.Value)`r`nexit /b %ERRORLEVEL%`r`n"
-            Set-Content -LiteralPath $_.Key -Value $content -Encoding Ascii
-            $actual = Get-Content -LiteralPath $_.Key -Raw
-            if ($actual -notmatch [regex]::Escape($_.Value)) { throw "BAT alias is wrong: $($_.Key)" }
+            'Start-Local-SplitScreen-Two-Controllers.bat' = '-Layout Vertical -InputMode TwoControllers';
+            'Start-Local-SplitScreen-Two-Controllers-TopBottom.bat' = '-Layout Horizontal -InputMode TwoControllers';
+            'Start-Local-SplitScreen.bat' = '-Layout Vertical -InputMode KeyboardController';
+            'Start-Local-SplitScreen-TopBottom.bat' = '-Layout Horizontal -InputMode KeyboardController';
           }
-          Write-Host 'All left/right and top/bottom BAT aliases: PASS'
+          foreach ($entry in $batMap.GetEnumerator()) {
+            $content = "@echo off`r`npowershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File `"%~dp0Start-TFE-Coop-Local.ps1`" $($entry.Value)`r`n"
+            Set-Content -LiteralPath (Join-Path fixture $entry.Key) -Value $content -Encoding Ascii
+          }
+          foreach ($name in @('Host-Coop.bat','Join-Coop.bat','Repair-TFE-Coop-Profiles.bat','SETUP-WINDOWS.bat')) {
+            Set-Content -LiteralPath (Join-Path fixture $name) -Value '@echo off' -Encoding Ascii
+          }
+          foreach ($name in @(
+            'START-HERE-WINDOWS.txt','LOCAL-COOP-INPUT-README.txt','MILESTONE4_1_8_INPUT_FULLSCREEN_FIX.txt',
+            'BUILD-PROVENANCE.txt','MICROSOFT-VC-RUNTIME-NOTE.txt'
+          )) {
+            Set-Content -LiteralPath (Join-Path fixture $name) -Value 'Milestone 4.1.8 verifier fixture' -Encoding Ascii
+          }
+
+          foreach ($relative in @(
+            'Shaders\blit.frag','UI_Images\TFE_TitleLogo.png','UI_Text\TfeMessages.txt',
+            'ExternalData\DarkForces\weapons.json','Captions\subtitles-en.txt',
+            'Fonts\README-REQUIRED.txt','SoundFonts\README-OPTIONAL.txt'
+          )) {
+            $path = Join-Path fixture $relative
+            New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+            Set-Content -LiteralPath $path -Value 'resource fixture' -Encoding Ascii
+          }
+
+          $root = (Resolve-Path fixture).Path
+          Get-ChildItem -LiteralPath fixture -Recurse -File |
+            Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
+            Sort-Object FullName |
+            ForEach-Object {
+              $relative = $_.FullName.Substring($root.Length + 1).Replace('\\','/')
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "${hash}  ${relative}"
+            } | Set-Content fixture\SHA256SUMS.txt -Encoding Ascii
+
+      - name: Execute the exact final package verifier
+        shell: powershell
+        run: |
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File fixture\VERIFY-WINDOWS.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Exact package verifier returned $LASTEXITCODE." }
+          Write-Host 'Exact Milestone 4.1.8 package verifier: PASS'

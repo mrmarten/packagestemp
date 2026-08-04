@@ -1,0 +1,106 @@
+name: Validate TFE Co-op M4.1.8 drop-in apply script
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  ENGINE_BUILD_RUN_ID: 30884905234
+  ENGINE_ARTIFACT_NAME: TFE-Coop-Milestone-4.1.8-MSVC-x64-self-contained
+
+jobs:
+  windows-powershell-51:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode and parse exact scripts
+        shell: powershell
+        run: |
+          $items = @(
+            @{ Encoded = 'm418-launcher/Start-TFE-Coop-Local.ps1.xz.b64'; Xz = 'launcher.xz'; Output = 'Start-TFE-Coop-Local.ps1'; Hash = 'c2c1addc78c3f5a1e5ac56755a95c9445261ce318ca97019f7de0621cce5a222' },
+            @{ Encoded = 'm418-launcher/VERIFY-WINDOWS.ps1.xz.b64'; Xz = 'verifier.xz'; Output = 'VERIFY-WINDOWS.ps1'; Hash = '062ab410f6f5ceeacc9d482a1c8bc667e7cc482f5f97db691e34f3bf687211be' },
+            @{ Encoded = 'm418-launcher/Repair-TFE-Coop-Profiles.ps1.xz.b64'; Xz = 'repair.xz'; Output = 'Repair-TFE-Coop-Profiles.ps1'; Hash = 'a3b03857696a6c61fa27ef6c8a281318735f7238baebf2aa6894cab7fc883263' },
+            @{ Encoded = 'm418-launcher/APPLY-MILESTONE-4.1.8-NATIVE-MSVC-HOTFIX.ps1.xz.b64'; Xz = 'apply.xz'; Output = 'APPLY-MILESTONE-4.1.8-NATIVE-MSVC-HOTFIX.ps1'; Hash = '81ca74c37b8b0cde9ecc668d1e18ab3ebf003b221e2b02d80a58646dc2c573bd' }
+          )
+          foreach ($item in $items) {
+            $encoded = (Get-Content $item.Encoded -Raw) -replace '\s',''
+            [IO.File]::WriteAllBytes($item.Xz,[Convert]::FromBase64String($encoded))
+            $source = & python -c "import lzma,sys; sys.stdout.buffer.write(lzma.decompress(open(sys.argv[1],'rb').read()))" $item.Xz
+            if ($LASTEXITCODE -ne 0) { throw "Decode failed: $($item.Output)" }
+            [IO.File]::WriteAllBytes($item.Output,[Text.Encoding]::Default.GetBytes(($source -join "`r`n")))
+          }
+          # Re-decode byte-exactly with Python; the loop above only ensures xz readability.
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          items = [
+            ('launcher.xz','Start-TFE-Coop-Local.ps1','c2c1addc78c3f5a1e5ac56755a95c9445261ce318ca97019f7de0621cce5a222'),
+            ('verifier.xz','VERIFY-WINDOWS.ps1','062ab410f6f5ceeacc9d482a1c8bc667e7cc482f5f97db691e34f3bf687211be'),
+            ('repair.xz','Repair-TFE-Coop-Profiles.ps1','a3b03857696a6c61fa27ef6c8a281318735f7238baebf2aa6894cab7fc883263'),
+            ('apply.xz','APPLY-MILESTONE-4.1.8-NATIVE-MSVC-HOTFIX.ps1','81ca74c37b8b0cde9ecc668d1e18ab3ebf003b221e2b02d80a58646dc2c573bd'),
+          ]
+          for compressed, output, expected in items:
+              data=lzma.decompress(Path(compressed).read_bytes())
+              actual=hashlib.sha256(data).hexdigest()
+              if actual != expected: raise SystemExit(f'{output}: {actual}')
+              Path(output).write_bytes(data)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Exact script checksum validation failed.' }
+          foreach ($script in $items.Output) {
+            $tokens=$null; $errors=$null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script),[ref]$tokens,[ref]$errors)
+            if ($errors.Count -gt 0) { $errors | Format-List -Force; throw "Parser errors: $script" }
+          }
+          Write-Host 'Exact apply script and companion scripts parse: PASS'
+
+      - name: Construct an existing-installation fixture
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory fixture -Force | Out-Null
+          gh run download $env:ENGINE_BUILD_RUN_ID --repo $env:GITHUB_REPOSITORY --name $env:ENGINE_ARTIFACT_NAME --dir fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Artifact download failed.' }
+          Move-Item fixture\DEPENDENCIES.txt fixture\NATIVE-MSVC-DEPENDENCIES.txt
+          Move-Item fixture\PE-HEADERS.txt fixture\NATIVE-MSVC-PE-HEADERS.txt
+          Move-Item fixture\SHA256SUMS.txt fixture\NATIVE-MSVC-ARTIFACT-SHA256SUMS.txt
+          Move-Item fixture\BUILD-INFO.txt fixture\ENGINE-BUILD-INFO.txt
+          Copy-Item .\Start-TFE-Coop-Local.ps1,.\VERIFY-WINDOWS.ps1,.\Repair-TFE-Coop-Profiles.ps1,.\APPLY-MILESTONE-4.1.8-NATIVE-MSVC-HOTFIX.ps1 fixture\
+
+          $batMap = @{
+            'Start-Local-SplitScreen-Keyboard-Controller.bat'='-Layout Vertical -InputMode KeyboardController';
+            'Start-Local-SplitScreen-Keyboard-Controller-TopBottom.bat'='-Layout Horizontal -InputMode KeyboardController';
+            'Start-Local-SplitScreen-Controller-Keyboard.bat'='-Layout Vertical -InputMode ControllerKeyboard';
+            'Start-Local-SplitScreen-Controller-Keyboard-TopBottom.bat'='-Layout Horizontal -InputMode ControllerKeyboard';
+            'Start-Local-SplitScreen-Two-Controllers.bat'='-Layout Vertical -InputMode TwoControllers';
+            'Start-Local-SplitScreen-Two-Controllers-TopBottom.bat'='-Layout Horizontal -InputMode TwoControllers';
+            'Start-Local-SplitScreen.bat'='-Layout Vertical -InputMode KeyboardController';
+            'Start-Local-SplitScreen-TopBottom.bat'='-Layout Horizontal -InputMode KeyboardController';
+          }
+          foreach ($entry in $batMap.GetEnumerator()) {
+            Set-Content (Join-Path fixture $entry.Key) "@echo off`r`npowershell.exe -File `"%~dp0Start-TFE-Coop-Local.ps1`" $($entry.Value)" -Encoding Ascii
+          }
+          foreach ($name in @('Host-Coop.bat','Join-Coop.bat','Repair-TFE-Coop-Profiles.bat','SETUP-WINDOWS.bat')) { Set-Content (Join-Path fixture $name) '@echo off' -Encoding Ascii }
+          foreach ($name in @('START-HERE-WINDOWS.txt','LOCAL-COOP-INPUT-README.txt','MILESTONE4_1_8_INPUT_FULLSCREEN_FIX.txt','BUILD-PROVENANCE.txt','MICROSOFT-VC-RUNTIME-NOTE.txt')) { Set-Content (Join-Path fixture $name) 'fixture' -Encoding Ascii }
+          foreach ($relative in @('Shaders\blit.frag','UI_Images\TFE_TitleLogo.png','UI_Text\TfeMessages.txt','ExternalData\DarkForces\weapons.json','Captions\subtitles-en.txt','Fonts\OpenSans-Regular.ttf')) {
+            $path=Join-Path fixture $relative; New-Item -ItemType Directory (Split-Path -Parent $path) -Force | Out-Null; Set-Content $path 'fixture' -Encoding Ascii
+          }
+          Set-Content fixture\libc++.dll 'legacy' -Encoding Ascii
+          Set-Content fixture\libunwind.dll 'legacy' -Encoding Ascii
+          Set-Content fixture\tfe_coop_splitscreen.exe 'legacy' -Encoding Ascii
+
+      - name: Apply drop-in and run the exact verifier
+        shell: powershell
+        run: |
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File fixture\APPLY-MILESTONE-4.1.8-NATIVE-MSVC-HOTFIX.ps1 -PackageDir fixture
+          if ($LASTEXITCODE -ne 0) { throw "Apply script returned $LASTEXITCODE." }
+          foreach ($legacy in @('libc++.dll','libunwind.dll','tfe_coop_splitscreen.exe')) {
+            if (Test-Path (Join-Path fixture $legacy)) { throw "Legacy file remains: $legacy" }
+          }
+          if ((Get-Content fixture\PROFILE-REPAIR-VERSION.txt -Raw).Trim() -ne '4.1.8') { throw 'Profile repair version was not updated.' }
+          Write-Host 'End-to-end drop-in apply and configured-font verifier test: PASS'

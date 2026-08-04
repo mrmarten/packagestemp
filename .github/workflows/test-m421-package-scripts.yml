@@ -1,0 +1,128 @@
+name: Validate exact TFE Co-op M4.2.1 Windows scripts
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode and checksum exact packaged scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $items = @(
+            @{ Encoded='m421-package/Start-TFE-Coop-Local.ps1.xz.b64'; Xz='launcher.xz'; Out='Start-TFE-Coop-Local.ps1'; Expected='878fcc867787e1b56d73deb10aea2709b3bb0058d1e2c6a2ce80031cb7a638ea' },
+            @{ Encoded='m421-package/VERIFY-WINDOWS.ps1.xz.b64'; Xz='verifier.xz'; Out='VERIFY-WINDOWS.ps1'; Expected='452064785788ab46a7c9fec2a2e28ece66328558a512160084f7d047466f8364' }
+          )
+          foreach ($item in $items) {
+            $encoded = (Get-Content -LiteralPath $item.Encoded -Raw) -replace '\s',''
+            [IO.File]::WriteAllBytes($item.Xz, [Convert]::FromBase64String($encoded))
+          }
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          items = [
+              ('launcher.xz','Start-TFE-Coop-Local.ps1','878fcc867787e1b56d73deb10aea2709b3bb0058d1e2c6a2ce80031cb7a638ea'),
+              ('verifier.xz','VERIFY-WINDOWS.ps1','452064785788ab46a7c9fec2a2e28ece66328558a512160084f7d047466f8364'),
+          ]
+          for compressed, output, expected in items:
+              source = lzma.decompress(Path(compressed).read_bytes())
+              actual = hashlib.sha256(source).hexdigest()
+              if actual != expected:
+                  raise SystemExit(f'{output} checksum mismatch: {actual}')
+              Path(output).write_bytes(source)
+              print(output, actual)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Script decode/checksum validation failed.' }
+          New-Item -ItemType File -Path .\theforceengine.exe -Force | Out-Null
+
+      - name: Parse scripts with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          foreach ($script in @('.\Start-TFE-Coop-Local.ps1','.\VERIFY-WINDOWS.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path -LiteralPath $script),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | Format-List -Force
+              throw "Windows PowerShell 5.1 parser reported errors in $script."
+            }
+          }
+          $launcher = Get-Content -LiteralPath .\Start-TFE-Coop-Local.ps1 -Raw
+          foreach ($required in @(
+            "Version = '4.2.1'",'--coop-wait-for-peer','--mute-music','Wait-ForConnectedPair',
+            'Campaign peer barrier satisfied for Host','Campaign peer barrier satisfied for Client',
+            'Controller 0 is opened exclusively by the Client','Music owner:','start the Host first',
+            'Never terminate an otherwise live session'
+          )) {
+            if (-not $launcher.Contains($required)) { throw "Missing launcher behavior: $required" }
+          }
+          $verifier = Get-Content -LiteralPath .\VERIFY-WINDOWS.ps1 -Raw
+          foreach ($required in @(
+            'Milestone 4.2.1','778dfafaa69381938e8c0c7b00069dbaa1958ada159daf028ab4f31a918371a7',
+            'Host-only music','Exclusive single-controller ownership','Wrong preflight version'
+          )) {
+            if (-not $verifier.Contains($required)) { throw "Missing verifier behavior: $required" }
+          }
+          Write-Host 'Windows PowerShell 5.1 parsing and source guards: PASS'
+
+      - name: Execute every non-launching layout and input preflight
+        shell: powershell
+        run: |
+          foreach ($layout in @('Vertical','Horizontal')) {
+            foreach ($mode in @('KeyboardController','ControllerKeyboard','TwoControllers')) {
+              $output = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+                -File .\Start-TFE-Coop-Local.ps1 `
+                -Layout $layout `
+                -InputMode $mode `
+                -ControllerDeadzone 0.20 `
+                -Fov 90 `
+                -MusicOwner Host `
+                -PreflightOnly 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                $output | ForEach-Object { Write-Host $_ }
+                throw "Preflight failed: $layout / $mode"
+              }
+              $json = $output | Where-Object { "$_" -match '^\{.*\}$' } | Select-Object -Last 1
+              if (-not $json) { throw "No preflight JSON: $layout / $mode" }
+              $data = $json | ConvertFrom-Json
+              if ($data.Version -ne '4.2.1') { throw "Wrong version: $($data.Version)" }
+              if (-not [bool]$data.PeerBarrierEnabled) { throw 'Peer barrier disabled.' }
+              if ($data.MusicOwner -ne 'Host' -or [bool]$data.HostMusicMuted -or -not [bool]$data.ClientMusicMuted) {
+                throw 'Host-only music ownership invalid.'
+              }
+              foreach ($args in @([string]$data.HostArguments,[string]$data.ClientArguments)) {
+                if ($args -notmatch '--coop-wait-for-peer') { throw 'Missing peer-barrier argument.' }
+                if ($args -notmatch '--controller-deadzone 0\.200') { throw 'Missing deadzone argument.' }
+                if ($args -notmatch '--widescreen') { throw 'Missing widescreen argument.' }
+                if ($args -notmatch '--fov 90') { throw 'Missing FOV argument.' }
+              }
+              if ([string]$data.ClientArguments -notmatch '--mute-music') { throw 'Client is not music-muted.' }
+              if ([string]$data.HostArguments -match '--mute-music') { throw 'Host is unexpectedly music-muted.' }
+              if ($mode -eq 'KeyboardController') {
+                if (-not [bool]$data.HostControllerDisabled) { throw 'Host controller is not disabled.' }
+                if ([string]$data.HostArguments -notmatch '--disable-controller') { throw 'Host lacks --disable-controller.' }
+                if ([string]$data.HostArguments -match '--controller-index') { throw 'Host still opens the physical controller.' }
+                if ([int]$data.ClientController -ne 0 -or [bool]$data.ClientControllerDisabled) { throw 'Client controller ownership invalid.' }
+                if ([string]$data.HostArguments -notmatch '--focus-window') { throw 'Host keyboard focus request missing.' }
+              }
+              if ($layout -eq 'Horizontal' -and ($data.HostPosition -ne 'TOP' -or $data.ClientPosition -ne 'BOTTOM')) {
+                throw 'Top/bottom positions invalid.'
+              }
+              if ($layout -eq 'Vertical' -and ($data.HostPosition -ne 'LEFT' -or $data.ClientPosition -ne 'RIGHT')) {
+                throw 'Left/right positions invalid.'
+              }
+            }
+          }
+          Write-Host 'All left/right and top/bottom input preflight paths: PASS'

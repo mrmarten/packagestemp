@@ -99,14 +99,17 @@ jobs:
               if (-not $json) { throw "No preflight JSON: $layout / $mode" }
               $data = $json | ConvertFrom-Json
               if ($data.Version -ne '4.2.0') { throw "Wrong version in preflight: $($data.Version)" }
+              if ($data.Layout -ne $layout) { throw "Layout was not preserved: $($data.Layout)" }
               if ([double]$data.ControllerDeadzone -ne 0.20) { throw 'Deadzone not preserved in preflight.' }
               if ([int]$data.Fov -ne 90) { throw 'FOV not preserved in preflight.' }
               if ($data.HostArguments -notmatch '--coop-host') { throw 'Host arguments lack --coop-host.' }
               if ($data.ClientArguments -notmatch '--coop-connect 127\.0\.0\.1') { throw 'Client arguments lack localhost connection.' }
+              $layoutToken = $layout.ToLowerInvariant()
               foreach ($args in @($data.HostArguments,$data.ClientArguments)) {
                 if ($args -notmatch '--controller-deadzone 0\.200') { throw 'Arguments lack deadzone override.' }
                 if ($args -notmatch '--widescreen') { throw 'Arguments lack forced widescreen.' }
                 if ($args -notmatch '--fov 90') { throw 'Arguments lack FOV 90.' }
+                if ($args -notmatch "--split-window $layoutToken [01]") { throw "Arguments lack the $layout split-window token." }
               }
               if ($mode -eq 'KeyboardController') {
                 if ([int]$data.HostController -ne 0 -or [int]$data.ClientController -ne 0) {
@@ -120,12 +123,6 @@ jobs:
               }
               if ($mode -eq 'ControllerKeyboard' -and $data.ClientArguments -notmatch '--focus-window') {
                 throw 'Keyboard Client lacks focus request.'
-              }
-              if ($layout -eq 'Horizontal' -and ($data.HostPosition -ne 'TOP' -or $data.ClientPosition -ne 'BOTTOM')) {
-                throw 'Top/bottom positions are incorrect.'
-              }
-              if ($layout -eq 'Vertical' -and ($data.HostPosition -ne 'LEFT' -or $data.ClientPosition -ne 'RIGHT')) {
-                throw 'Left/right positions are incorrect.'
               }
             }
           }

@@ -109,9 +109,13 @@ jobs:
                 if ($args -notmatch '--fov 90') { throw 'Arguments lack FOV 90.' }
               }
               if ($mode -eq 'KeyboardController') {
-                if ([int]$data.HostController -ne 31 -or [int]$data.ClientController -ne 0) {
-                  throw 'Keyboard/controller ownership is incorrect.'
+                if ([int]$data.HostController -ne 0 -or [int]$data.ClientController -ne 0) {
+                  throw 'Mirrored Host UI / Client gameplay controller ownership is incorrect.'
                 }
+                if (-not [bool]$data.HostControllerUiOnly -or [bool]$data.ClientControllerUiOnly) {
+                  throw 'Host UI-only controller flags are incorrect.'
+                }
+                if ($data.HostArguments -notmatch '--controller-ui-only') { throw 'Host lacks controller UI-only mode.' }
                 if ($data.HostArguments -notmatch '--focus-window') { throw 'Keyboard Host lacks focus request.' }
               }
               if ($mode -eq 'ControllerKeyboard' -and $data.ClientArguments -notmatch '--focus-window') {

@@ -1,0 +1,65 @@
+name: Validate final TFE Co-op M4.2.2 package verifier
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode and checksum exact verifier
+        shell: pwsh
+        run: |
+          $encoded = (Get-Content m422-final/VERIFY-WINDOWS.ps1.xz.b64 -Raw) -replace '\s',''
+          [IO.File]::WriteAllBytes('verifier.xz', [Convert]::FromBase64String($encoded))
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          source = lzma.decompress(Path('verifier.xz').read_bytes())
+          expected = 'b78437da269234dd16e4e91a9f078167403b39e014262317d28793589b8522a9'
+          actual = hashlib.sha256(source).hexdigest()
+          if actual != expected:
+              raise SystemExit(f'verifier checksum mismatch: {actual}')
+          Path('VERIFY-WINDOWS.ps1').write_bytes(source)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Verifier decode/checksum failed.' }
+
+      - name: Parse and inspect with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\VERIFY-WINDOWS.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Force
+            throw 'Windows PowerShell 5.1 parser reported verifier errors.'
+          }
+          $text = Get-Content .\VERIFY-WINDOWS.ps1 -Raw
+          foreach ($required in @(
+            "'Milestone: 4.2.2'",
+            "'SHA256SUMS.txt'",
+            "'fdfefb4d465b92bfbb64286c1630544b9fadac785304353fc652d113b6b7e23e'",
+            "'2d84085648a1b055d75d5708fe0c9c42946d213691d4a0f4b99bb6bae6e93855'",
+            "'f9336f99646c44b4a9067a9242aa9636f4543a76b0ee23760b7aee27cf6df32e'",
+            'serviceHostCampaignFlow(now);',
+            'starting Client without waiting for log flush',
+            'ConnectionTimeoutSeconds -ne 45',
+            'Required 4.2.2 launcher safeguard or feature is missing',
+            'Package SHA-256 manifest: OK'
+          )) {
+            if (-not $text.Contains($required)) { throw "Required final-verifier marker absent: $required" }
+          }
+          foreach ($forbidden in @('Required 4.2.1 launcher safeguard or feature is missing','$controllerProfile:','Static MSVC supervisor active')) {
+            if ($text.Contains($forbidden)) { throw "Forbidden final-verifier regression remains: $forbidden" }
+          }
+          Write-Host 'Exact final verifier Windows PowerShell 5.1 parsing: PASS'

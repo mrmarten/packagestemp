@@ -23,7 +23,7 @@ jobs:
         run: |
           $items = @(
             @{ Encoded = 'm418-launcher/Start-TFE-Coop-Local.ps1.xz.b64'; Compressed = 'launcher.xz'; Output = 'Start-TFE-Coop-Local.ps1'; Hash = 'c2c1addc78c3f5a1e5ac56755a95c9445261ce318ca97019f7de0621cce5a222' },
-            @{ Encoded = 'm418-launcher/VERIFY-WINDOWS.ps1.xz.b64'; Compressed = 'verifier.xz'; Output = 'VERIFY-WINDOWS.ps1'; Hash = 'f360230b2f113e269dd9df92d083e8277d9c7a51222dff023cf4d4da765ec3b4' },
+            @{ Encoded = 'm418-launcher/VERIFY-WINDOWS.ps1.xz.b64'; Compressed = 'verifier.xz'; Output = 'VERIFY-WINDOWS.ps1'; Hash = '062ab410f6f5ceeacc9d482a1c8bc667e7cc482f5f97db691e34f3bf687211be' },
             @{ Encoded = 'm418-launcher/Repair-TFE-Coop-Profiles.ps1.xz.b64'; Compressed = 'repair.xz'; Output = 'Repair-TFE-Coop-Profiles.ps1'; Hash = 'a3b03857696a6c61fa27ef6c8a281318735f7238baebf2aa6894cab7fc883263' }
           )
           foreach ($item in $items) {
@@ -35,7 +35,7 @@ jobs:
           from pathlib import Path
           items = [
               ('launcher.xz', 'Start-TFE-Coop-Local.ps1', 'c2c1addc78c3f5a1e5ac56755a95c9445261ce318ca97019f7de0621cce5a222'),
-              ('verifier.xz', 'VERIFY-WINDOWS.ps1', 'f360230b2f113e269dd9df92d083e8277d9c7a51222dff023cf4d4da765ec3b4'),
+              ('verifier.xz', 'VERIFY-WINDOWS.ps1', '062ab410f6f5ceeacc9d482a1c8bc667e7cc482f5f97db691e34f3bf687211be'),
               ('repair.xz', 'Repair-TFE-Coop-Profiles.ps1', 'a3b03857696a6c61fa27ef6c8a281318735f7238baebf2aa6894cab7fc883263'),
           ]
           for compressed, output, expected in items:

@@ -1,0 +1,54 @@
+name: Collect TFE Co-op M4.2.5 build artifacts
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      SOURCE_BRANCH: tfe-coop-m425-balanced-performance
+    steps:
+      - name: Wait for the matching push build
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id=''
+          for attempt in $(seq 1 120); do
+            run_id=$(gh run list --repo "$GITHUB_REPOSITORY" \
+              --workflow build-m425-balanced-performance.yml \
+              --branch "$SOURCE_BRANCH" --event push --limit 20 \
+              --json databaseId,headSha \
+              --jq ".[] | select(.headSha == \"$HEAD_SHA\") | .databaseId" | head -n 1)
+            if [ -n "$run_id" ]; then break; fi
+            echo "Waiting for push workflow for $HEAD_SHA (attempt $attempt/120)..."
+            sleep 15
+          done
+          if [ -z "$run_id" ]; then
+            echo 'No matching Milestone 4.2.5 push workflow run was found.' >&2
+            exit 1
+          fi
+          echo "RUN_ID=$run_id" >> "$GITHUB_ENV"
+          echo "Found push workflow run $run_id."
+          gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15
+
+      - name: Download all validated build artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p collected
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir collected
+          find collected -maxdepth 3 -type f -printf '%p  %s bytes\n' | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-4.2.5-Collected-Builds
+          path: collected/
+          if-no-files-found: error
+          retention-days: 7

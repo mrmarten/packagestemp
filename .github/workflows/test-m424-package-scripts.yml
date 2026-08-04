@@ -1,0 +1,112 @@
+name: Validate exact TFE Co-op M4.2.4 package scripts
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode and checksum exact launcher and verifier
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $items = @(
+            @{ Encoded='m424-package/Start-TFE-Coop-Local.ps1.xz.b64'; Xz='launcher.xz'; Output='Start-TFE-Coop-Local.ps1'; SourceHash='0f6ae8e0efc162dd81ee5fe3a5adb38b99fedb72134612cfe2adcfc49e4b42d8' },
+            @{ Encoded='m424-package/VERIFY-WINDOWS.ps1.xz.b64'; Xz='verifier.xz'; Output='VERIFY-WINDOWS.ps1'; SourceHash='8e9c2485acc17f8fb856bfd36f47f4b8e8b7b1441be687ad1e7a8472e70593b7' }
+          )
+          foreach ($item in $items) {
+            $compact = (Get-Content -LiteralPath $item.Encoded -Raw) -replace '\s',''
+            [IO.File]::WriteAllBytes($item.Xz, [Convert]::FromBase64String($compact))
+          }
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          items = [
+              ('launcher.xz', 'Start-TFE-Coop-Local.ps1', '0f6ae8e0efc162dd81ee5fe3a5adb38b99fedb72134612cfe2adcfc49e4b42d8'),
+              ('verifier.xz', 'VERIFY-WINDOWS.ps1', '8e9c2485acc17f8fb856bfd36f47f4b8e8b7b1441be687ad1e7a8472e70593b7'),
+          ]
+          for compressed, output, expected in items:
+              source = lzma.decompress(Path(compressed).read_bytes())
+              actual = hashlib.sha256(source).hexdigest()
+              if actual != expected:
+                  raise SystemExit(f'{output} checksum mismatch: {actual}')
+              Path(output).write_bytes(source)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Exact script reconstruction failed.' }
+          New-Item -ItemType File -Path .\theforceengine.exe -Force | Out-Null
+
+      - name: Parse exact scripts with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          foreach ($script in @('.\Start-TFE-Coop-Local.ps1','.\VERIFY-WINDOWS.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | Format-List -Force
+              throw "Windows PowerShell 5.1 parser reported errors in $script."
+            }
+          }
+
+          $launcher = Get-Content .\Start-TFE-Coop-Local.ps1 -Raw
+          foreach ($required in @(
+            "Version = '4.2.4'",'--coop-wait-for-peer','--disable-controller','--mute-music',
+            '--controller-deadzone','--widescreen','--fov','--split-window','Wait-ForConnectedPair',
+            'starting Client without waiting for log flush','Start-Sleep -Milliseconds 350'
+          )) {
+            if (-not $launcher.Contains($required)) { throw "Required launcher feature absent: $required" }
+          }
+          foreach ($forbidden in @('coop-local-channel','$splitExe','$controllerProfile:','Static MSVC supervisor active')) {
+            if ($launcher.Contains($forbidden)) { throw "Excluded or obsolete launcher code remains: $forbidden" }
+          }
+
+          $verifier = Get-Content .\VERIFY-WINDOWS.ps1 -Raw
+          foreach ($required in @(
+            'RemotePlayerAnimationState','s_troopAnimTable[ANIM_MOVE]','s_troopAnimTable[ANIM_ATTACK1]',
+            's_frameTicks[frameRate]','fireCycleLatched','triggerRemotePlayerFireAnimation();',
+            "Wrong preflight version",'Milestone 4.2.3 local-IPC experiment absent: OK'
+          )) {
+            if (-not $verifier.Contains($required)) { throw "Required verifier guard absent: $required" }
+          }
+          Write-Host 'Exact launcher and verifier parse/source guards: PASS'
+
+      - name: Execute every exact non-launching split-screen preflight
+        shell: powershell
+        run: |
+          foreach ($layout in @('Vertical','Horizontal')) {
+            foreach ($mode in @('KeyboardController','ControllerKeyboard','TwoControllers')) {
+              $output = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+                -File .\Start-TFE-Coop-Local.ps1 -Layout $layout -InputMode $mode -DisplayIndex 0 -PreflightOnly 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                $output | ForEach-Object { Write-Host $_ }
+                throw "Preflight failed: $layout / $mode"
+              }
+              $json = $output | Where-Object { "$_" -match '^\{.*\}$' } | Select-Object -Last 1
+              if (-not $json) { throw "No preflight JSON: $layout / $mode" }
+              $data = $json | ConvertFrom-Json
+              if ([string]$data.Version -ne '4.2.4') { throw "Wrong version: $($data.Version)" }
+              if ([string]$data.Layout -ne $layout -or [string]$data.InputMode -ne $mode) { throw 'Layout/input mismatch.' }
+              if ([string]$data.HostArguments -notmatch '--coop-host' -or [string]$data.ClientArguments -notmatch '--coop-connect 127\.0\.0\.1') { throw 'Network arguments are incomplete.' }
+              foreach ($args in @([string]$data.HostArguments,[string]$data.ClientArguments)) {
+                if ($args -notmatch '--coop-wait-for-peer') { throw 'Peer barrier argument absent.' }
+                if ($args -notmatch '--widescreen' -or $args -notmatch '--fov 90') { throw 'Widescreen/FOV arguments absent.' }
+                if ($args -notmatch '--controller-deadzone 0\.200') { throw 'Deadzone argument absent.' }
+              }
+              if ($mode -eq 'KeyboardController') {
+                if (-not [bool]$data.HostControllerDisabled -or [int]$data.ClientController -ne 0) { throw 'Keyboard/controller ownership is invalid.' }
+                if (-not [bool]$data.ClientMusicMuted -or [bool]$data.HostMusicMuted) { throw 'Host-only music configuration is invalid.' }
+              }
+            }
+          }
+          Write-Host 'All left/right and top/bottom exact preflights: PASS'

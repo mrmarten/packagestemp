@@ -1,4 +1,4 @@
-name: Build TFE Co-op M4.1.7 MSVC engine
+name: Build TFE Co-op M4.1.8 native MSVC engine
 
 on:
   pull_request:
@@ -9,11 +9,70 @@ permissions:
 
 env:
   TFE_SHA: 54eab324e9b265c503b51c3690f030f42a0f9fcc
-  B64_SHA256: f2a7eec673a104572bc8d5f70aabdf872b4581a36c5b89ddd8688e810b12d458
-  XZ_SHA256: 95995772a116923b9c26773c1a97468ce931f6b9240a3a3a21bd8ef7283c11dd
-  PATCH_SHA256: 930647d0fd18912203c0dda3b028f950134830e84925c01700c65f48d40e41c0
+  M417_B64_SHA256: f2a7eec673a104572bc8d5f70aabdf872b4581a36c5b89ddd8688e810b12d458
+  M417_XZ_SHA256: 95995772a116923b9c26773c1a97468ce931f6b9240a3a3a21bd8ef7283c11dd
+  M417_PATCH_SHA256: 930647d0fd18912203c0dda3b028f950134830e84925c01700c65f48d40e41c0
+  M418_B64_SHA256: 89a777082a42c8d1881dda2148025d37129bebf0b2030f2159c576fc02c78bf6
+  M418_XZ_SHA256: 938d3cb1441f33b71b297c50d7a2bfdc14dc1b9a67c99f086ea43d79fee3db1f
+  M418_PATCH_SHA256: 788da95b1e4310ce270fd0553b02fb9e14e5b6668c40764b5dd4bff03fe434ae
 
 jobs:
+  protocol-tests:
+    name: Co-op protocol tests and sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct patched source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat m417-patch/part-*.txt | tr -d '\r\n\t ' > m417.patch.xz.b64
+          test "$(sha256sum m417.patch.xz.b64 | awk '{print $1}')" = "$M417_B64_SHA256"
+          base64 -d m417.patch.xz.b64 > m417.patch.xz
+          test "$(sha256sum m417.patch.xz | awk '{print $1}')" = "$M417_XZ_SHA256"
+          xz -dc m417.patch.xz > m417.patch
+          test "$(sha256sum m417.patch | awk '{print $1}')" = "$M417_PATCH_SHA256"
+
+          cat m418-delta/part-*.txt | tr -d '\r\n\t ' > m418.patch.xz.b64
+          test "$(sha256sum m418.patch.xz.b64 | awk '{print $1}')" = "$M418_B64_SHA256"
+          base64 -d m418.patch.xz.b64 > m418.patch.xz
+          test "$(sha256sum m418.patch.xz | awk '{print $1}')" = "$M418_XZ_SHA256"
+          xz -dc m418.patch.xz > m418.patch
+          test "$(sha256sum m418.patch | awk '{print $1}')" = "$M418_PATCH_SHA256"
+
+          git clone --filter=blob:none https://github.com/TheForceEngine/TheForceEngine.git tfe
+          git -C tfe checkout "$TFE_SHA"
+          git -C tfe apply --check "$GITHUB_WORKSPACE/m417.patch"
+          git -C tfe apply "$GITHUB_WORKSPACE/m417.patch"
+          git -C tfe apply --check "$GITHUB_WORKSPACE/m418.patch"
+          git -C tfe apply "$GITHUB_WORKSPACE/m418.patch"
+          git -C tfe diff --check
+
+      - name: Run protocol tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tfe
+          bash tests/coop/build_and_run.sh
+
+      - name: Run AddressSanitizer and UndefinedBehaviorSanitizer
+        shell: bash
+        env:
+          COOP_SANITIZE: 1
+          COOP_TEST_BUILD_DIR: ${{ github.workspace }}/tfe/build/coop-tests-sanitized
+        run: |
+          set -euo pipefail
+          cd tfe
+          bash tests/coop/build_and_run.sh
+
+      - name: Validate campaign-certifier fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tfe
+          python3 Tools/CoopCertification/coop_campaign_certify.py --self-test
+
   windows:
     name: Native MSVC x64 engine
     runs-on: windows-2025
@@ -21,43 +80,58 @@ jobs:
       - uses: actions/checkout@v4
       - uses: microsoft/setup-msbuild@v2
 
-      - name: Reconstruct and apply exact cumulative co-op patch
+      - name: Reconstruct and apply exact cumulative and delta patches
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $parts = Get-ChildItem m417-patch/part-*.txt | Sort-Object Name
-          if ($parts.Count -ne 12) { throw "Expected 12 patch chunks, found $($parts.Count)." }
-          $raw = ($parts | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join ''
-          $compact = $raw -replace '\s',''
-          [IO.File]::WriteAllText('m417.patch.xz.b64', $compact, [Text.Encoding]::ASCII)
-          $b64Hash = (Get-FileHash m417.patch.xz.b64 -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($b64Hash -ne $env:B64_SHA256) { throw "Base64 checksum mismatch: $b64Hash" }
 
-          [IO.File]::WriteAllBytes('m417.patch.xz', [Convert]::FromBase64String($compact))
-          $xzHash = (Get-FileHash m417.patch.xz -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($xzHash -ne $env:XZ_SHA256) { throw "XZ checksum mismatch: $xzHash" }
+          $m417Parts = Get-ChildItem m417-patch/part-*.txt | Sort-Object Name
+          if ($m417Parts.Count -ne 12) { throw "Expected 12 Milestone 4.1.7 chunks, found $($m417Parts.Count)." }
+          $m417Compact = (($m417Parts | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join '') -replace '\s',''
+          [IO.File]::WriteAllText('m417.patch.xz.b64', $m417Compact, [Text.Encoding]::ASCII)
+          if ((Get-FileHash m417.patch.xz.b64 -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:M417_B64_SHA256) { throw 'M4.1.7 Base64 checksum mismatch.' }
+          [IO.File]::WriteAllBytes('m417.patch.xz', [Convert]::FromBase64String($m417Compact))
+          if ((Get-FileHash m417.patch.xz -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:M417_XZ_SHA256) { throw 'M4.1.7 XZ checksum mismatch.' }
+
+          $m418Parts = Get-ChildItem m418-delta/part-*.txt | Sort-Object Name
+          if ($m418Parts.Count -ne 1) { throw "Expected one Milestone 4.1.8 delta chunk, found $($m418Parts.Count)." }
+          $m418Compact = (($m418Parts | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join '') -replace '\s',''
+          [IO.File]::WriteAllText('m418.patch.xz.b64', $m418Compact, [Text.Encoding]::ASCII)
+          if ((Get-FileHash m418.patch.xz.b64 -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:M418_B64_SHA256) { throw 'M4.1.8 Base64 checksum mismatch.' }
+          [IO.File]::WriteAllBytes('m418.patch.xz', [Convert]::FromBase64String($m418Compact))
+          if ((Get-FileHash m418.patch.xz -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:M418_XZ_SHA256) { throw 'M4.1.8 XZ checksum mismatch.' }
 
           @'
           import hashlib, lzma
           from pathlib import Path
-          compressed = Path('m417.patch.xz').read_bytes()
-          patch = lzma.decompress(compressed)
-          Path('m417.patch').write_bytes(patch)
-          print('Patch bytes:', len(patch))
-          print('Patch SHA-256:', hashlib.sha256(patch).hexdigest())
+          for compressed_name, patch_name, expected in [
+              ('m417.patch.xz', 'm417.patch', '930647d0fd18912203c0dda3b028f950134830e84925c01700c65f48d40e41c0'),
+              ('m418.patch.xz', 'm418.patch', '788da95b1e4310ce270fd0553b02fb9e14e5b6668c40764b5dd4bff03fe434ae'),
+          ]:
+              patch = lzma.decompress(Path(compressed_name).read_bytes())
+              actual = hashlib.sha256(patch).hexdigest()
+              if actual != expected:
+                  raise SystemExit(f'{patch_name} checksum mismatch: {actual}')
+              Path(patch_name).write_bytes(patch)
           '@ | python -
-          if ($LASTEXITCODE -ne 0) { throw 'Patch decompression failed.' }
-          $patchHash = (Get-FileHash m417.patch -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($patchHash -ne $env:PATCH_SHA256) { throw "Patch checksum mismatch: $patchHash" }
+          if ($LASTEXITCODE -ne 0) { throw 'Patch decompression/checksum failed.' }
 
           git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
           git -C tfe checkout $env:TFE_SHA
           git -C tfe apply --check (Resolve-Path m417.patch)
           git -C tfe apply (Resolve-Path m417.patch)
+          git -C tfe apply --check (Resolve-Path m418.patch)
+          git -C tfe apply (Resolve-Path m418.patch)
           git -C tfe diff --check
-          if (-not (Test-Path tfe\TheForceEngine\TFE_DarkForces\Coop\coop.h -PathType Leaf)) {
-            throw 'The reconstructed source tree is missing the co-op implementation.'
-          }
+          if (-not (Test-Path tfe\TheForceEngine\TFE_DarkForces\Coop\coop.h -PathType Leaf)) { throw 'Co-op source is missing.' }
+          if (-not (Select-String -LiteralPath tfe\TheForceEngine\main.cpp -SimpleMatch 'split-window' -Quiet)) { throw 'Split-window engine support is missing.' }
+          if (-not (Select-String -LiteralPath tfe\TheForceEngine\TFE_DarkForces\GameUI\agentMenu.cpp -SimpleMatch 'CONTROLLER_BUTTON_START' -Quiet)) { throw 'Controller Agent Menu support is missing.' }
+
+          Push-Location tfe
+          try {
+            git diff --binary | Set-Content -LiteralPath ..\TFE-Coop-Milestone-4.1.8-Source.patch -Encoding UTF8
+          } finally { Pop-Location }
+          Copy-Item m418.patch TFE-Coop-Milestone-4.1.8-Delta.patch
 
       - name: Force static native MSVC runtime
         shell: pwsh
@@ -75,7 +149,6 @@ jobs:
           project.write_text(text, encoding='utf-8-sig', newline='\n')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw 'Failed to set the static MSVC runtime.' }
-          Select-String -LiteralPath tfe\TheForceEngine\TheForceEngine.vcxproj -SimpleMatch '<RuntimeLibrary>MultiThreaded</RuntimeLibrary>'
 
       - name: Build Windows x64 with MSVC
         shell: pwsh
@@ -104,17 +177,15 @@ jobs:
             if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required runtime DLL missing: $dll" }
             Copy-Item $source artifact\$dll
           }
-          Copy-Item m417.patch artifact\TFE-Coop-Milestone-4.1.7-Source.patch
+          Copy-Item TFE-Coop-Milestone-4.1.8-Source.patch artifact\TFE-Coop-Milestone-4.1.8-Source.patch
+          Copy-Item TFE-Coop-Milestone-4.1.8-Delta.patch artifact\TFE-Coop-Milestone-4.1.8-Delta.patch
           Copy-Item tfe\LICENSE artifact\LICENSE
 
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
           $vs = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
-          if ([string]::IsNullOrWhiteSpace($vs)) { throw 'Visual Studio C++ toolchain was not found for dependency validation.' }
+          if ([string]::IsNullOrWhiteSpace($vs)) { throw 'Visual Studio C++ toolchain was not found.' }
           $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
 
-          # Upstream SDL2_image/Ogg/Vorbis/Theora DLLs import VCRUNTIME140.dll.
-          # Include Microsoft's signed x64 redistributable DLL so the package is
-          # self-contained and does not ask the user to download an arbitrary DLL.
           $redistRoot = Join-Path $vs 'VC\Redist\MSVC'
           $vcRuntime = Get-ChildItem -LiteralPath $redistRoot -Recurse -Filter VCRUNTIME140.dll -File |
             Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC\d+\.CRT\\VCRUNTIME140\.dll$' -and $_.FullName -notmatch '\\onecore\\' } |
@@ -122,8 +193,7 @@ jobs:
             Select-Object -First 1
           if (-not $vcRuntime) { throw "Signed x64 VCRUNTIME140.dll was not found below $redistRoot" }
           $signature = Get-AuthenticodeSignature -LiteralPath $vcRuntime.FullName
-          if ($signature.Status -ne 'Valid') { throw "VCRUNTIME140.dll signature is not valid: $($signature.Status)" }
-          if ($signature.SignerCertificate.Subject -notmatch 'Microsoft') { throw 'VCRUNTIME140.dll is not signed by Microsoft.' }
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') { throw 'VCRUNTIME140.dll signature validation failed.' }
           Copy-Item $vcRuntime.FullName artifact\VCRUNTIME140.dll
           @(
             "Source: $($vcRuntime.FullName)",
@@ -150,39 +220,39 @@ jobs:
           }
           $allDllDeps = Get-Content artifact\MULTIMEDIA-DLL-DEPENDENCIES.txt -Raw
           foreach ($forbidden in @('libunwind.dll','libc++.dll','libgcc_s_seh-1.dll','libstdc++-6.dll')) {
-            if ($allDllDeps -match [regex]::Escape($forbidden)) { throw "Forbidden LLVM/MinGW dependency remains in a bundled DLL: $forbidden" }
+            if ($allDllDeps -match [regex]::Escape($forbidden)) { throw "Forbidden LLVM/MinGW dependency remains: $forbidden" }
           }
-          if ($allDllDeps -notmatch 'VCRUNTIME140\.dll') { throw 'Bundled DLL dependency report did not expose the expected VCRUNTIME140 dependency.' }
-
-          $headers = Get-Content artifact\PE-HEADERS.txt -Raw
-          if ($headers -notmatch 'machine \(x64\)') { throw 'The resulting executable is not x64.' }
+          if ((Get-Content artifact\PE-HEADERS.txt -Raw) -notmatch 'machine \(x64\)') { throw 'The resulting executable is not x64.' }
 
           Push-Location artifact
           try {
             $smoke = Start-Process -FilePath .\theforceengine.exe -ArgumentList '--help' -PassThru
             Start-Sleep -Seconds 3
-            if (-not $smoke.HasExited) {
-              Stop-Process -Id $smoke.Id -Force
-              $smoke.WaitForExit()
-            }
+            if (-not $smoke.HasExited) { Stop-Process -Id $smoke.Id -Force; $smoke.WaitForExit() }
           } catch {
             throw "The native engine failed Windows loader smoke testing: $($_.Exception.Message)"
-          } finally {
-            Pop-Location
-          }
+          } finally { Pop-Location }
+
+          @(
+            'Milestone: 4.1.8',
+            "Upstream commit: $env:TFE_SHA",
+            'Compiler: Microsoft Visual C++ x64, static C++ runtime',
+            'Local split layouts: vertical left/right and horizontal top/bottom',
+            'Input: controller-backed Host campaign UI plus Client gameplay controller',
+            'Display: SDL physical display bounds, borderless always-on-top halves'
+          ) | Set-Content artifact\BUILD-INFO.txt -Encoding UTF8
 
           Get-FileHash artifact\* -Algorithm SHA256 |
             Sort-Object Path |
             ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), [IO.Path]::GetFileName($_.Path) } |
             Set-Content artifact\SHA256SUMS.txt -Encoding Ascii
           Get-Content artifact\DEPENDENCIES.txt
-          Get-Content artifact\VCRUNTIME140-PROVENANCE.txt
           Get-Content artifact\SHA256SUMS.txt
 
       - name: Upload native engine artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TFE-Coop-Milestone-4.1.7-MSVC-x64-self-contained
+          name: TFE-Coop-Milestone-4.1.8-MSVC-x64-self-contained
           path: artifact/
           if-no-files-found: error
           retention-days: 7

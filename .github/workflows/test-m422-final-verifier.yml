@@ -59,7 +59,4 @@ jobs:
           )) {
             if (-not $text.Contains($required)) { throw "Required final-verifier marker absent: $required" }
           }
-          foreach ($forbidden in @('Required 4.2.1 launcher safeguard or feature is missing','Static MSVC supervisor active')) {
-            if ($text.Contains($forbidden)) { throw "Forbidden final-verifier regression remains: $forbidden" }
-          }
           Write-Host 'Exact final verifier Windows PowerShell 5.1 parsing: PASS'

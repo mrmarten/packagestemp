@@ -1,0 +1,128 @@
+name: Validate exact TFE Co-op M4.2.0 Windows scripts
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode and checksum the exact packaged scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $items = @(
+            @{ Encoded='m420-package/Start-TFE-Coop-Local.ps1.xz.b64'; Xz='launcher.xz'; Out='Start-TFE-Coop-Local.ps1'; Expected='79705a2bf48fa6b30428f12859c0fb2396a2c6c1525c191ba66055aa0e175840' },
+            @{ Encoded='m420-package/VERIFY-WINDOWS.ps1.xz.b64'; Xz='verifier.xz'; Out='VERIFY-WINDOWS.ps1'; Expected='adcb9e777cedf5d8b03da35828f7a198741aac42f47ac044befef838ce953be7' },
+            @{ Encoded='m420-package/APPLY-MILESTONE-4.2.0-HOTFIX.ps1.xz.b64'; Xz='apply.xz'; Out='APPLY-MILESTONE-4.2.0-HOTFIX.ps1'; Expected='b81b153d60a9505189683c1fcf24aceab73370d649aea3b0465f4182cbef5106' }
+          )
+          foreach ($item in $items) {
+            $encoded = (Get-Content -LiteralPath $item.Encoded -Raw) -replace '\s',''
+            [IO.File]::WriteAllBytes($item.Xz, [Convert]::FromBase64String($encoded))
+          }
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          items = [
+              ('launcher.xz','Start-TFE-Coop-Local.ps1','79705a2bf48fa6b30428f12859c0fb2396a2c6c1525c191ba66055aa0e175840'),
+              ('verifier.xz','VERIFY-WINDOWS.ps1','adcb9e777cedf5d8b03da35828f7a198741aac42f47ac044befef838ce953be7'),
+              ('apply.xz','APPLY-MILESTONE-4.2.0-HOTFIX.ps1','b81b153d60a9505189683c1fcf24aceab73370d649aea3b0465f4182cbef5106'),
+          ]
+          for compressed, output, expected in items:
+              source = lzma.decompress(Path(compressed).read_bytes())
+              actual = hashlib.sha256(source).hexdigest()
+              if actual != expected:
+                  raise SystemExit(f'{output} checksum mismatch: {actual}')
+              Path(output).write_bytes(source)
+              print(output, actual)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Script decode or checksum validation failed.' }
+          New-Item -ItemType File -Path .\theforceengine.exe -Force | Out-Null
+
+      - name: Parse all scripts with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          foreach ($script in @(
+            '.\Start-TFE-Coop-Local.ps1',
+            '.\VERIFY-WINDOWS.ps1',
+            '.\APPLY-MILESTONE-4.2.0-HOTFIX.ps1'
+          )) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path -LiteralPath $script),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | Format-List -Force
+              throw "Windows PowerShell 5.1 parser reported errors in $script."
+            }
+          }
+
+          $text = Get-Content -LiteralPath .\Start-TFE-Coop-Local.ps1 -Raw
+          foreach ($forbidden in @('$controllerProfile:', '$splitExe', 'Static MSVC supervisor active', 'Controller validation failed')) {
+            if ($text.Contains($forbidden)) { throw "Forbidden launcher regression remains: $forbidden" }
+          }
+          foreach ($required in @(
+            '--controller-deadzone','--widescreen','--fov','--focus-window',
+            'ControllerDeadzone = 0.20','Fov = 90','Never terminate an otherwise live session',
+            'Start-Process -FilePath $engineExe','Version = ''4.2.0'''
+          )) {
+            if (-not $text.Contains($required)) { throw "Required 4.2.0 launcher behavior is absent: $required" }
+          }
+          Write-Host 'Windows PowerShell 5.1 parsing and source guards: PASS'
+
+      - name: Execute every non-launching layout and input preflight
+        shell: powershell
+        run: |
+          foreach ($layout in @('Vertical','Horizontal')) {
+            foreach ($mode in @('KeyboardController','ControllerKeyboard','TwoControllers')) {
+              $output = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+                -File .\Start-TFE-Coop-Local.ps1 `
+                -Layout $layout `
+                -InputMode $mode `
+                -ControllerDeadzone 0.20 `
+                -Fov 90 `
+                -PreflightOnly 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                $output | ForEach-Object { Write-Host $_ }
+                throw "Preflight failed: $layout / $mode"
+              }
+              $json = $output | Where-Object { "$_" -match '^\{.*\}$' } | Select-Object -Last 1
+              if (-not $json) { throw "No preflight JSON: $layout / $mode" }
+              $data = $json | ConvertFrom-Json
+              if ($data.Version -ne '4.2.0') { throw "Wrong version in preflight: $($data.Version)" }
+              if ([double]$data.ControllerDeadzone -ne 0.20) { throw 'Deadzone not preserved in preflight.' }
+              if ([int]$data.Fov -ne 90) { throw 'FOV not preserved in preflight.' }
+              if ($data.HostArguments -notmatch '--coop-host') { throw 'Host arguments lack --coop-host.' }
+              if ($data.ClientArguments -notmatch '--coop-connect 127\.0\.0\.1') { throw 'Client arguments lack localhost connection.' }
+              foreach ($args in @($data.HostArguments,$data.ClientArguments)) {
+                if ($args -notmatch '--controller-deadzone 0\.200') { throw 'Arguments lack deadzone override.' }
+                if ($args -notmatch '--widescreen') { throw 'Arguments lack forced widescreen.' }
+                if ($args -notmatch '--fov 90') { throw 'Arguments lack FOV 90.' }
+              }
+              if ($mode -eq 'KeyboardController') {
+                if ([int]$data.HostController -ne 31 -or [int]$data.ClientController -ne 0) {
+                  throw 'Keyboard/controller ownership is incorrect.'
+                }
+                if ($data.HostArguments -notmatch '--focus-window') { throw 'Keyboard Host lacks focus request.' }
+              }
+              if ($mode -eq 'ControllerKeyboard' -and $data.ClientArguments -notmatch '--focus-window') {
+                throw 'Keyboard Client lacks focus request.'
+              }
+              if ($layout -eq 'Horizontal' -and ($data.HostPosition -ne 'TOP' -or $data.ClientPosition -ne 'BOTTOM')) {
+                throw 'Top/bottom positions are incorrect.'
+              }
+              if ($layout -eq 'Vertical' -and ($data.HostPosition -ne 'LEFT' -or $data.ClientPosition -ne 'RIGHT')) {
+                throw 'Left/right positions are incorrect.'
+              }
+            }
+          }
+          Write-Host 'All left/right and top/bottom preflight paths: PASS'

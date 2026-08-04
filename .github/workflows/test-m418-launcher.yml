@@ -50,9 +50,9 @@ jobs:
             if ($text.Contains($forbidden)) { throw "Forbidden launcher regression remains: $forbidden" }
           }
           foreach ($required in @(
-            '${controllerProfile}:','Assert-ProcessAlive','Wait-ForMainWindowHandle',
-            '[IntPtr]::Zero','Start-Process -FilePath $engineExe','--split-window',
-            '--split-display','--controller-ui-only','Set-ConsoleVisibility'
+            'Assert-ProcessAlive','Wait-ForMainWindowHandle','[IntPtr]::Zero',
+            'Start-Process -FilePath $engineExe','--split-window','--split-display',
+            '--controller-ui-only','Set-ConsoleVisibility','Wait-ForControllerOpen'
           )) {
             if (-not $text.Contains($required)) { throw "Required launcher safeguard is absent: $required" }
           }

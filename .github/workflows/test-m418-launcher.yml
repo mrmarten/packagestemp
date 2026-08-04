@@ -1,0 +1,111 @@
+name: Validate TFE Co-op M4.1.8 launcher
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode exact launcher
+        shell: pwsh
+        run: |
+          $encoded = (Get-Content m418-launcher/Start-TFE-Coop-Local.ps1.xz.b64 -Raw) -replace '\s',''
+          [IO.File]::WriteAllBytes('launcher.xz', [Convert]::FromBase64String($encoded))
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          source = lzma.decompress(Path('launcher.xz').read_bytes())
+          expected = 'c2c1addc78c3f5a1e5ac56755a95c9445261ce318ca97019f7de0621cce5a222'
+          actual = hashlib.sha256(source).hexdigest()
+          if actual != expected:
+              raise SystemExit(f'launcher checksum mismatch: {actual}')
+          Path('Start-TFE-Coop-Local.ps1').write_bytes(source)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher decode/checksum failed.' }
+          New-Item -ItemType File -Path .\theforceengine.exe -Force | Out-Null
+
+      - name: Parse with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\Start-TFE-Coop-Local.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Force
+            throw 'Windows PowerShell 5.1 parser reported launcher errors.'
+          }
+          $text = Get-Content .\Start-TFE-Coop-Local.ps1 -Raw
+          foreach ($forbidden in @('$controllerProfile:', '$splitExe', 'Static MSVC supervisor active', '--window-rect')) {
+            if ($text.Contains($forbidden)) { throw "Forbidden launcher regression remains: $forbidden" }
+          }
+          foreach ($required in @(
+            '${controllerProfile}:','Assert-ProcessAlive','Wait-ForMainWindowHandle',
+            '[IntPtr]::Zero','Start-Process -FilePath $engineExe','--split-window',
+            '--split-display','--controller-ui-only','Set-ConsoleVisibility'
+          )) {
+            if (-not $text.Contains($required)) { throw "Required launcher safeguard is absent: $required" }
+          }
+          Write-Host 'Windows PowerShell 5.1 parse: PASS'
+
+      - name: Execute every layout and input preflight
+        shell: powershell
+        run: |
+          foreach ($layout in @('Vertical','Horizontal')) {
+            foreach ($mode in @('KeyboardController','ControllerKeyboard','TwoControllers')) {
+              $output = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+                -File .\Start-TFE-Coop-Local.ps1 -Layout $layout -InputMode $mode -DisplayIndex 0 -PreflightOnly 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                $output | ForEach-Object { Write-Host $_ }
+                throw "Preflight failed: $layout / $mode"
+              }
+              $json = $output | Where-Object { "$_" -match '^\{.*\}$' } | Select-Object -Last 1
+              if (-not $json) { throw "No JSON for $layout / $mode" }
+              $data = $json | ConvertFrom-Json
+              if ($data.Version -ne '4.1.8') { throw 'Unexpected launcher version.' }
+              if ($data.Layout -ne $layout -or $data.InputMode -ne $mode) { throw 'Preflight metadata mismatch.' }
+
+              $layoutToken = $layout.ToLowerInvariant()
+              if ($data.HostArguments -notmatch "--split-window $layoutToken 0") { throw 'Host split-window arguments are wrong.' }
+              if ($data.ClientArguments -notmatch "--split-window $layoutToken 1") { throw 'Client split-window arguments are wrong.' }
+              if ($data.HostArguments -notmatch '--split-display 0' -or $data.ClientArguments -notmatch '--split-display 0') { throw 'Display arguments are missing.' }
+              if ($data.HostArguments -notmatch '--coop-host' -or $data.ClientArguments -notmatch '--coop-connect 127\.0\.0\.1') { throw 'Network arguments are wrong.' }
+
+              if ($mode -eq 'KeyboardController') {
+                if ([int]$data.HostController -ne 0 -or [int]$data.ClientController -ne 0) { throw 'Mirrored controller indices are wrong.' }
+                if (-not [bool]$data.HostControllerUiOnly) { throw 'Host UI-only controller mode is missing.' }
+                if ($data.HostArguments -notmatch '--controller-ui-only') { throw 'Host UI-only argument is missing.' }
+              }
+              if ($mode -eq 'ControllerKeyboard' -and $data.ClientArguments -notmatch '--disable-controller') { throw 'Keyboard Client controller disable is missing.' }
+              if ($mode -eq 'TwoControllers' -and ([int]$data.HostController -ne 0 -or [int]$data.ClientController -ne 1)) { throw 'Two-controller indices are wrong.' }
+            }
+          }
+          Write-Host 'Vertical left/right and horizontal top/bottom preflights: PASS'
+
+      - name: Validate release BAT aliases
+        shell: powershell
+        run: |
+          @{
+            'Start-Local-SplitScreen-Keyboard-Controller.bat' = '-Layout Vertical -InputMode KeyboardController';
+            'Start-Local-SplitScreen-Keyboard-Controller-TopBottom.bat' = '-Layout Horizontal -InputMode KeyboardController';
+            'Start-Local-SplitScreen-Two-Controllers.bat' = '-Layout Vertical -InputMode TwoControllers';
+            'Start-Local-SplitScreen-Two-Controllers-TopBottom.bat' = '-Layout Horizontal -InputMode TwoControllers';
+            'Start-Local-SplitScreen-Controller-Keyboard.bat' = '-Layout Vertical -InputMode ControllerKeyboard';
+            'Start-Local-SplitScreen-Controller-Keyboard-TopBottom.bat' = '-Layout Horizontal -InputMode ControllerKeyboard';
+          }.GetEnumerator() | ForEach-Object {
+            $content = "@echo off`r`nsetlocal`r`npowershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File `"%~dp0Start-TFE-Coop-Local.ps1`" $($_.Value)`r`nexit /b %ERRORLEVEL%`r`n"
+            Set-Content -LiteralPath $_.Key -Value $content -Encoding Ascii
+            $actual = Get-Content -LiteralPath $_.Key -Raw
+            if ($actual -notmatch [regex]::Escape($_.Value)) { throw "BAT alias is wrong: $($_.Key)" }
+          }
+          Write-Host 'All left/right and top/bottom BAT aliases: PASS'

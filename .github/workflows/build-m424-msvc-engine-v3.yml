@@ -1,0 +1,205 @@
+name: Build TFE Co-op M4.2.4 animation release v3
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-tests:
+    name: Reconstruct source and test animation fix
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct exact 4.2.4 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat m417-patch/part-*.txt | tr -d '[:space:]' | base64 -d > m417.patch.xz
+          tr -d '[:space:]' < m418-delta/part-00.txt | base64 -d > m418.patch.xz
+          tr -d '[:space:]' < m419-delta/engine.patch.xz.b64 | base64 -d > m419.patch.xz
+          tr -d '[:space:]' < m420-delta/engine.patch.xz.b64 | base64 -d > m420.patch.xz
+          tr -d '[:space:]' < m421-delta/engine.patch.xz.b64 | base64 -d > m421.patch.xz
+          tr -d '[:space:]' < m422-delta/engine.patch.xz.b64 | base64 -d > m422.patch.xz
+          tr -d '[:space:]' < m424-delta/engine.patch.xz.b64 | base64 -d > m424.patch.xz
+
+          echo '95995772a116923b9c26773c1a97468ce931f6b9240a3a3a21bd8ef7283c11dd  m417.patch.xz' | sha256sum -c -
+          echo '938d3cb1441f33b71b297c50d7a2bfdc14dc1b9a67c99f086ea43d79fee3db1f  m418.patch.xz' | sha256sum -c -
+          echo 'ddeb4959895c7dc722e07aca889930227371b6e077647a2c0c286a076a8a0652  m419.patch.xz' | sha256sum -c -
+          echo '7651d29c7eebea809f4bd1dbd9b05431e2f15f08844f6941221d9283e3ef1819  m420.patch.xz' | sha256sum -c -
+          echo '5553f249c589c45f77b11dda1760cd34310b0a8b664008d901a8887691c9e995  m421.patch.xz' | sha256sum -c -
+          echo '78ff52ccdd6c8db278f175958b4aa99387a5fd334c442d4e78c7f4726269405e  m422.patch.xz' | sha256sum -c -
+          echo 'cc61e385b1010cb309b57a19eaef4cd224d2b1a6dbadd1643490c1fd2fa42418  m424.patch.xz' | sha256sum -c -
+
+          for name in m417 m418 m419 m420 m421 m422 m424; do xz -dc "$name.patch.xz" > "$name.patch"; done
+          echo '930647d0fd18912203c0dda3b028f950134830e84925c01700c65f48d40e41c0  m417.patch' | sha256sum -c -
+          echo '788da95b1e4310ce270fd0553b02fb9e14e5b6668c40764b5dd4bff03fe434ae  m418.patch' | sha256sum -c -
+          echo 'f6302f64d6d62800bdba755d69e892c089c03a166d5809d2634361ef32bc3466  m419.patch' | sha256sum -c -
+          echo '2213bb54f52600439ad393db4e9448764db3c3441c2a8dc109fc4e51e7bc909b  m420.patch' | sha256sum -c -
+          echo '778dfafaa69381938e8c0c7b00069dbaa1958ada159daf028ab4f31a918371a7  m421.patch' | sha256sum -c -
+          echo 'f9336f99646c44b4a9067a9242aa9636f4543a76b0ee23760b7aee27cf6df32e  m422.patch' | sha256sum -c -
+          echo '16d2a11968b41215c6146ef0cdfa44c3a9422eec35a55654a27d8378f036b546  m424.patch' | sha256sum -c -
+
+          git clone --depth 1 https://github.com/TheForceEngine/TheForceEngine.git tfe
+          git -C tfe fetch --depth 1 origin 54eab324e9b265c503b51c3690f030f42a0f9fcc
+          git -C tfe checkout 54eab324e9b265c503b51c3690f030f42a0f9fcc
+          for patch in m417.patch m418.patch m419.patch m420.patch m421.patch m422.patch m424.patch; do
+            git -C tfe apply --check "$(pwd)/$patch"
+            git -C tfe apply "$(pwd)/$patch"
+          done
+          git -C tfe diff --check
+          cp m424.patch tfe/TFE-Coop-Milestone-4.2.4-Engine-Delta.patch
+
+      - name: Check focused animation implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          c = Path('tfe/TheForceEngine/TFE_DarkForces/Coop/coop.cpp').read_text()
+          required = [
+              'struct RemotePlayerAnimationState',
+              'advanceRemotePlayerAnimation()',
+              's_frameTicks[frameRate]',
+              's_troopAnimTable[ANIM_MOVE]',
+              's_troopAnimTable[ANIM_ATTACK1]',
+              'fireCycleLatched',
+              'triggerRemotePlayerFireAnimation();',
+              'STORMFIN.WAX',
+              'serviceHostCampaignFlow(now);',
+          ]
+          missing = [x for x in required if x not in c]
+          if missing: raise SystemExit('Missing animation guards: ' + ', '.join(missing))
+          bad = 's_remotePlayer->anim = moving ? 0 : 5;\n\t\t\ts_remotePlayer->frame = 0;'
+          if bad in c: raise SystemExit('Per-packet frame reset regression remains.')
+          print('Remote-player animation guards: PASS')
+          PY
+
+      - name: Run protocol, session, sanitizer, and campaign tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tfe
+          ./tests/coop/build_and_run.sh
+          COOP_SANITIZE=1 COOP_TEST_BUILD_DIR=build/coop-tests-sanitized \
+            ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+            UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            ./tests/coop/build_and_run.sh
+          python3 Tools/CoopCertification/coop_campaign_certify.py --self-test
+
+      - name: Archive tested source tree
+        shell: bash
+        run: tar -czf tfe-m424-source.tar.gz tfe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-4.2.4-Tested-Source
+          path: tfe-m424-source.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Native MSVC x64 engine
+    needs: source-tests
+    runs-on: windows-2025
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-4.2.4-Tested-Source
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Extract tested source and force static MSVC runtime
+        shell: pwsh
+        run: |
+          tar -xzf tfe-m424-source.tar.gz
+          @'
+          from pathlib import Path
+          project = Path('tfe/TheForceEngine/TheForceEngine.vcxproj')
+          text = project.read_text(encoding='utf-8-sig')
+          marker = "  <ItemDefinitionGroup Condition=\"'$(Configuration)|$(Platform)'=='Release|x64'\">\n    <ClCompile>\n"
+          if marker not in text: raise SystemExit('Release x64 ClCompile block not found')
+          if '<RuntimeLibrary>MultiThreaded</RuntimeLibrary>' not in text:
+              text = text.replace(marker, marker + '      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>\n', 1)
+          project.write_text(text, encoding='utf-8-sig', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to set static MSVC runtime.' }
+
+      - name: Build Windows x64 with MSVC
+        shell: pwsh
+        run: |
+          msbuild tfe\TheForceEngine.sln /m /restore /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE." }
+
+      - name: Package and inspect native engine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Get-ChildItem tfe -Recurse -Filter *.exe |
+            Where-Object { $_.Name -match '^TheForceEngine\.exe$|^theforceengine\.exe$' -and $_.FullName -match '\\Release\\' } |
+            Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $exe) { throw 'The Force Engine executable was not found.' }
+          $pdb = Get-ChildItem tfe -Recurse -Filter *.pdb |
+            Where-Object { $_.Name -match '^TheForceEngine\.pdb$|^theforceengine\.pdb$' -and $_.FullName -match '\\Release\\' } |
+            Sort-Object Length -Descending | Select-Object -First 1
+
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item $exe.FullName artifact\theforceengine.exe
+          if ($pdb) { Copy-Item $pdb.FullName artifact\theforceengine.pdb }
+          foreach ($dll in @('SDL2.dll','SDL2_image.dll','ogg.dll','theora.dll','vorbis.dll')) {
+            $source = Join-Path 'tfe\TheForceEngine' $dll
+            if (-not (Test-Path $source -PathType Leaf)) { throw "Missing runtime DLL: $dll" }
+            Copy-Item $source artifact\$dll
+          }
+          Copy-Item tfe\TFE-Coop-Milestone-4.2.4-Engine-Delta.patch artifact\
+          Copy-Item tfe\LICENSE artifact\LICENSE
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+          if ([string]::IsNullOrWhiteSpace($vs)) { throw 'Visual Studio C++ toolchain not found.' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $runtime = Get-ChildItem (Join-Path $vs 'VC\Redist\MSVC') -Recurse -Filter VCRUNTIME140.dll -File |
+            Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC\d+\.CRT\\VCRUNTIME140\.dll$' -and $_.FullName -notmatch '\\onecore\\' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $runtime) { throw 'Signed x64 VCRUNTIME140.dll not found.' }
+          $sig = Get-AuthenticodeSignature $runtime.FullName
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') { throw 'VCRUNTIME140 signature validation failed.' }
+          Copy-Item $runtime.FullName artifact\VCRUNTIME140.dll
+          @(
+            "Source: $($runtime.FullName)",
+            "SHA-256: $((Get-FileHash $runtime.FullName -Algorithm SHA256).Hash.ToLowerInvariant())",
+            "Signature status: $($sig.Status)",
+            "Signer: $($sig.SignerCertificate.Subject)"
+          ) | Set-Content artifact\VCRUNTIME140-PROVENANCE.txt -Encoding UTF8
+
+          $cmd = 'call "' + $vcvars + '" && dumpbin.exe /headers artifact\theforceengine.exe > artifact\PE-HEADERS.txt && dumpbin.exe /dependents artifact\theforceengine.exe > artifact\DEPENDENCIES.txt'
+          & cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw 'dumpbin validation failed.' }
+          $deps = Get-Content artifact\DEPENDENCIES.txt -Raw
+          foreach ($forbidden in @('libunwind.dll','libc++.dll','VCRUNTIME140.dll','MSVCP140.dll')) {
+            if ($deps -match [regex]::Escape($forbidden)) { throw "Forbidden direct dependency: $forbidden" }
+          }
+          if ((Get-Content artifact\PE-HEADERS.txt -Raw) -notmatch 'machine \(x64\)') { throw 'Executable is not x64.' }
+
+          Push-Location artifact
+          try {
+            $smoke = Start-Process .\theforceengine.exe -ArgumentList '--help' -PassThru
+            Start-Sleep -Seconds 3
+            if (-not $smoke.HasExited) { Stop-Process -Id $smoke.Id -Force; $smoke.WaitForExit() }
+          } catch { throw "Windows loader smoke test failed: $($_.Exception.Message)" }
+          finally { Pop-Location }
+
+          Get-FileHash artifact\* -Algorithm SHA256 | Sort-Object Path |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), [IO.Path]::GetFileName($_.Path) } |
+            Set-Content artifact\SHA256SUMS.txt -Encoding Ascii
+          Get-Content artifact\DEPENDENCIES.txt
+          Get-Content artifact\SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-4.2.4-MSVC-x64-self-contained-v3
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7

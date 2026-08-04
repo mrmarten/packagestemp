@@ -1,0 +1,116 @@
+name: Build exact TFE Co-op M4.1.8 symbols
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TFE_SHA: 54eab324e9b265c503b51c3690f030f42a0f9fcc
+  M417_B64_SHA256: f2a7eec673a104572bc8d5f70aabdf872b4581a36c5b89ddd8688e810b12d458
+  M417_XZ_SHA256: 95995772a116923b9c26773c1a97468ce931f6b9240a3a3a21bd8ef7283c11dd
+  M417_PATCH_SHA256: 930647d0fd18912203c0dda3b028f950134830e84925c01700c65f48d40e41c0
+  M418_B64_SHA256: 89a777082a42c8d1881dda2148025d37129bebf0b2030f2159c576fc02c78bf6
+  M418_XZ_SHA256: 938d3cb1441f33b71b297c50d7a2bfdc14dc1b9a67c99f086ea43d79fee3db1f
+  M418_PATCH_SHA256: 788da95b1e4310ce270fd0553b02fb9e14e5b6668c40764b5dd4bff03fe434ae
+  EXPECTED_EXE_SHA256: 5bb5fa0d68388c763ab9edc45504dc85560552bb8bad410f0e621069677b5e77
+
+jobs:
+  symbols:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Reconstruct exact source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parts = Get-ChildItem m417-patch/part-*.txt | Sort-Object Name
+          if ($parts.Count -ne 12) { throw "Expected 12 M4.1.7 chunks." }
+          $b64 = (($parts | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join '') -replace '\s',''
+          [IO.File]::WriteAllText('m417.patch.xz.b64',$b64,[Text.Encoding]::ASCII)
+          if ((Get-FileHash m417.patch.xz.b64 -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:M417_B64_SHA256) { throw 'M417 b64 hash mismatch' }
+          [IO.File]::WriteAllBytes('m417.patch.xz',[Convert]::FromBase64String($b64))
+          if ((Get-FileHash m417.patch.xz -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:M417_XZ_SHA256) { throw 'M417 xz hash mismatch' }
+
+          $b64 = ([IO.File]::ReadAllText((Resolve-Path m418-delta/part-00.txt))) -replace '\s',''
+          [IO.File]::WriteAllText('m418.patch.xz.b64',$b64,[Text.Encoding]::ASCII)
+          if ((Get-FileHash m418.patch.xz.b64 -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:M418_B64_SHA256) { throw 'M418 b64 hash mismatch' }
+          [IO.File]::WriteAllBytes('m418.patch.xz',[Convert]::FromBase64String($b64))
+          if ((Get-FileHash m418.patch.xz -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:M418_XZ_SHA256) { throw 'M418 xz hash mismatch' }
+
+          @'
+          import hashlib,lzma
+          from pathlib import Path
+          for src,out,expected in [
+            ('m417.patch.xz','m417.patch','930647d0fd18912203c0dda3b028f950134830e84925c01700c65f48d40e41c0'),
+            ('m418.patch.xz','m418.patch','788da95b1e4310ce270fd0553b02fb9e14e5b6668c40764b5dd4bff03fe434ae')]:
+              b=lzma.decompress(Path(src).read_bytes())
+              if hashlib.sha256(b).hexdigest()!=expected: raise SystemExit(out+' hash mismatch')
+              Path(out).write_bytes(b)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'decompression failed' }
+
+          git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
+          git -C tfe checkout $env:TFE_SHA
+          git -C tfe apply (Resolve-Path m417.patch)
+          git -C tfe apply (Resolve-Path m418.patch)
+          git -C tfe diff --check
+
+      - name: Force static runtime and build exact Release x64
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          p=Path('tfe/TheForceEngine/TheForceEngine.vcxproj')
+          s=p.read_text(encoding='utf-8-sig')
+          marker="  <ItemDefinitionGroup Condition=\"'$(Configuration)|$(Platform)'=='Release|x64'\">\n    <ClCompile>\n"
+          if marker not in s: raise SystemExit('marker missing')
+          if '<RuntimeLibrary>MultiThreaded</RuntimeLibrary>' not in s:
+              s=s.replace(marker,marker+'      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>\n',1)
+          p.write_text(s,encoding='utf-8-sig',newline='\n')
+          '@ | python -
+          msbuild tfe\TheForceEngine.sln /m /restore /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+          if ($LASTEXITCODE -ne 0) { throw 'MSBuild failed' }
+
+      - name: Verify exact binary and collect symbols
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $exe=Get-ChildItem tfe -Recurse -Filter TheForceEngine.exe | Where-Object FullName -match '\\Release\\' | Sort-Object Length -Descending | Select-Object -First 1
+          $pdb=Get-ChildItem tfe -Recurse -Filter TheForceEngine.pdb | Where-Object FullName -match '\\Release\\' | Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $exe -or -not $pdb) { throw 'EXE or PDB missing' }
+          $hash=(Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "EXE=$($exe.FullName)`nPDB=$($pdb.FullName)`nEXE_SHA256=$hash" | Set-Content symbol-build.txt
+          if ($hash -ne $env:EXPECTED_EXE_SHA256) { throw "Rebuilt EXE differs from crash binary: $hash" }
+          New-Item artifact -ItemType Directory -Force | Out-Null
+          Copy-Item $exe.FullName artifact\theforceengine.exe
+          Copy-Item $pdb.FullName artifact\TheForceEngine.pdb
+          Copy-Item symbol-build.txt artifact\symbol-build.txt
+
+          $vswhere=Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs=(& $vswhere -latest -products * -property installationPath | Select-Object -First 1)
+          $tools=@()
+          if ($vs) {
+            $tools += Get-ChildItem $vs -Recurse -Filter llvm-symbolizer.exe -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+            $tools += Get-ChildItem $vs -Recurse -Filter llvm-pdbutil.exe -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+            $tools += Get-ChildItem $vs -Recurse -Filter dia2dump.exe -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          }
+          $tools | Set-Content artifact\available-symbol-tools.txt
+          $sym=$tools | Where-Object { [IO.Path]::GetFileName($_) -ieq 'llvm-symbolizer.exe' } | Select-Object -First 1
+          if ($sym) {
+            Push-Location artifact
+            try {
+              @('0x1404267ea','0x1401b0790','0x1400d5780','0x140347db6','0x140347dba') | & $sym --obj=theforceengine.exe --functions=linkage --inlines --demangle | Set-Content SYMBOLIZED-ADDRESSES.txt
+            } finally { Pop-Location }
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-M4.1.8-exact-symbols
+          path: artifact/
+          retention-days: 7
+          if-no-files-found: error

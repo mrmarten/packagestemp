@@ -1,0 +1,59 @@
+name: Validate exact final TFE Co-op M4.2.5 verifier v2
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct and checksum exact verifier
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem m425-package/verifier-parts/part-*.txt | Sort-Object Name
+          if ($parts.Count -ne 4) { throw "Expected four verifier chunks, found $($parts.Count)." }
+          $compact = (($parts | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join '') -replace '\s',''
+          [IO.File]::WriteAllBytes('verifier.xz', [Convert]::FromBase64String($compact))
+          if ((Get-FileHash verifier.xz -Algorithm SHA256).Hash.ToLowerInvariant() -ne '52d9160af7c5f67334ac5881a306017f0ba66aeae884f6c7a03e61d51e99d289') {
+            throw 'Verifier XZ checksum mismatch.'
+          }
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          source = lzma.decompress(Path('verifier.xz').read_bytes())
+          actual = hashlib.sha256(source).hexdigest()
+          expected = '66eb474e3c6b487019011672fee66cb8a6a063332346acf95a25fa738d4b033b'
+          if actual != expected: raise SystemExit(f'verifier checksum mismatch: {actual}')
+          Path('VERIFY-WINDOWS.ps1').write_bytes(source)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Verifier reconstruction failed.' }
+
+      - name: Parse exact verifier with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\VERIFY-WINDOWS.ps1), [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Force
+            throw 'Windows PowerShell 5.1 parser reported verifier errors.'
+          }
+          $text = Get-Content .\VERIFY-WINDOWS.ps1 -Raw
+          foreach ($required in @(
+            'Milestone 4.2.5 native MSVC x64 engine: OK',
+            'Balanced Host/Client pacing, scheduling, and snapshot work: OK',
+            'TFE-Coop-Milestone-4.2.5-Engine-Delta.patch',
+            'ProcessPowerThrottling','AvSetMmThreadCharacteristicsW(L"Games"',
+            'frameLimiter_setLowLatency','MaxClientWorldBatchesPerFrame',
+            'foreach ($rate in @(60,120,240))','--local-coop-performance','--local-frame-rate'
+          )) {
+            if (-not $text.Contains($required)) { throw "Required verifier guard absent: $required" }
+          }
+          Write-Host 'Exact Milestone 4.2.5 verifier Windows PowerShell 5.1 parse: PASS'

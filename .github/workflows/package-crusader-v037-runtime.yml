@@ -1,0 +1,109 @@
+name: Package Crusader Co-op v0.3.7 runtime
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/package-crusader-v037-runtime.yml'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  package-runtime:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+      VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_cache,readwrite
+      VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/scummvm-src/.github/vcpkg-ports
+      GIT_VCPKG_COMMIT: ef7dbf94b9198bc58f45951adcf1f041fcbc5ea0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout ScummVM manifest
+        uses: actions/checkout@v4
+        with:
+          repository: scummvm/scummvm
+          ref: v2026.3.0
+          path: scummvm-src
+          fetch-depth: 1
+
+      - name: Download successful v0.3.7 runtime artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: crusader-coop-v0.3.7-built-runtime
+          path: built-runtime
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 31168927724
+
+      - name: Install vcpkg
+        uses: lukka/run-vcpkg@v11
+        id: runvcpkg
+        with:
+          vcpkgGitCommitId: ${{ env.GIT_VCPKG_COMMIT }}
+
+      - name: Restore dependency binary cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_cache
+          key: crusader-v037-vcpkg-${{ env.GIT_VCPKG_COMMIT }}-x64-${{ hashFiles('scummvm-src/vcpkg.json') }}
+          restore-keys: |
+            crusader-v037-vcpkg-${{ env.GIT_VCPKG_COMMIT }}-x64-
+
+      - name: Rehydrate release dependencies
+        working-directory: scummvm-src
+        shell: pwsh
+        run: |
+          vcpkg install
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed with $LASTEXITCODE" }
+
+      - name: Copy all app-local release DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runtime = Resolve-Path built-runtime
+          $releaseDlls = Get-ChildItem -LiteralPath $env:VCPKG_INSTALLED_DIR -Recurse -Filter '*.dll' -File |
+            Where-Object { $_.FullName -notmatch '[\\/]debug[\\/]' }
+          if (-not $releaseDlls) { throw 'No vcpkg release DLLs were found.' }
+          $byName = @{}
+          foreach ($dll in $releaseDlls) {
+            $key = $dll.Name.ToLowerInvariant()
+            if (-not $byName.ContainsKey($key)) {
+              Copy-Item $dll.FullName (Join-Path $runtime $dll.Name) -Force
+              $byName[$key] = $dll.FullName
+            }
+          }
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vsPath = & $vswhere -latest -products * -property installationPath
+          if (-not $vsPath) { throw 'Visual Studio installation not found.' }
+          $redistRoot = Join-Path $vsPath 'VC/Redist/MSVC'
+          $redistVersion = Get-ChildItem -LiteralPath $redistRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $crtDir = Join-Path $redistVersion.FullName 'x64/Microsoft.VC143.CRT'
+          if (-not (Test-Path $crtDir)) { throw "CRT directory not found: $crtDir" }
+          Get-ChildItem -LiteralPath $crtDir -Filter '*.dll' -File | Copy-Item -Destination $runtime -Force
+
+          $required = @('SDL2.dll','SDL2_net.dll','freetype.dll','FLAC.dll','faad-2.dll','vorbisfile.dll','zlib1.dll','MSVCP140.dll','VCRUNTIME140.dll')
+          foreach ($name in $required) {
+            if (-not (Test-Path (Join-Path $runtime $name))) { throw "Required runtime DLL missing: $name" }
+          }
+
+          $files = Get-ChildItem -LiteralPath $runtime -File | Sort-Object Name
+          $files | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content (Join-Path $runtime 'SHA256SUMS-WITH-DLLS.txt') -Encoding ascii
+          "DLL_COUNT=$((Get-ChildItem $runtime -Filter '*.dll' -File).Count)" | Set-Content (Join-Path $runtime 'RUNTIME-DLL-RESULT.txt') -Encoding ascii
+
+      - name: Upload complete runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: crusader-coop-v0.3.7-complete-runtime
+          path: built-runtime/**
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30

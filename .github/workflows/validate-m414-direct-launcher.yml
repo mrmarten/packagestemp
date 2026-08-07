@@ -1,0 +1,61 @@
+name: Validate TFE Co-op 4.1.4 direct launcher
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode exact launcher
+        shell: pwsh
+        run: |
+          $encoded = (Get-Content m42-supervisor/Start-TFE-Coop-Local-4.1.4-direct.ps1.xz.b64 -Raw) -replace '\s',''
+          [IO.File]::WriteAllBytes('launcher.xz', [Convert]::FromBase64String($encoded))
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          data = lzma.decompress(Path('launcher.xz').read_bytes())
+          Path('Start-TFE-Coop-Local.ps1').write_bytes(data)
+          digest = hashlib.sha256(data).hexdigest()
+          if digest != '68ab83c79a9d06c4b11520e2e1a187cc1bbbc14fc51b8cc17acfbbfd146ca92a':
+              raise SystemExit(f'launcher checksum mismatch: {digest}')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher decode failed.' }
+
+      - name: Parse and inspect with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\Start-TFE-Coop-Local.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Force
+            throw 'Windows PowerShell parser reported launcher syntax errors.'
+          }
+          $text = Get-Content .\Start-TFE-Coop-Local.ps1 -Raw
+          if ($text -match 'tfe_coop_splitscreen\.exe') { throw 'Blocked native supervisor is still referenced.' }
+          if (($text | Select-String -Pattern 'Start-Process -FilePath \$engineExe' -AllMatches).Matches.Count -lt 2) {
+            throw 'Direct Host/Client process start logic is missing.'
+          }
+          if ($text -notmatch 'WindowsBuiltInRole]::Administrator') { throw 'Elevation guard is missing.' }
+          if ($text -match '\$controllerProfile:') { throw 'Unsafe variable interpolation remains.' }
+          if ($text -notmatch '\$\{controllerProfile\}:') { throw 'Safe variable interpolation is missing.' }
+          Write-Host 'Windows PowerShell 5.1 direct-launcher validation: PASS'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-4.1.4-Direct-Launcher
+          path: Start-TFE-Coop-Local.ps1
+          if-no-files-found: error
+          retention-days: 7

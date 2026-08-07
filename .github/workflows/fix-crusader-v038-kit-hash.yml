@@ -1,0 +1,35 @@
+name: Fix Crusader v0.3.8 kit hash
+
+on:
+  push:
+    branches:
+      - crusader-v038-build
+
+permissions:
+  contents: write
+
+jobs:
+  fix-workflow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: crusader-v038-build
+          fetch-depth: 0
+      - name: Correct verified build-kit digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          file=.github/workflows/build-crusader-v038.yml
+          old=acee9170aa51a2b3e524a9b2ed16b1019b89271fbed26542a46dc51b1a6e223
+          new=5946be50980bf79286ff9c80bb9412243f234e153cb94a0583592fad35769ff3
+          sed -i "s/$old/$new/g" "$file"
+          if git diff --quiet -- "$file"; then
+            echo 'Workflow digest already corrected.'
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add "$file"
+          git commit -m 'Correct verified v0.3.8 build-kit digest'
+          git push origin HEAD:crusader-v038-build

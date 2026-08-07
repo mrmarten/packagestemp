@@ -30,18 +30,16 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $parts = Get-ChildItem -LiteralPath crusader-v038 -Filter 'kit-part-*.b64' -File | Sort-Object Name
-          if (-not $parts -or $parts.Count -eq 0) { throw 'No build-kit chunks found.' }
-          $builder = [System.Text.StringBuilder]::new()
-          foreach ($part in $parts) {
-            [void]$builder.Append((Get-Content -LiteralPath $part.FullName -Raw).Trim())
-          }
-          [IO.File]::WriteAllBytes('kit.zip', [Convert]::FromBase64String($builder.ToString()))
-          $actualKitHash = (Get-FileHash kit.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualKitHash -ne '356aec72cbd08894ebdfce89725283df3cdab6f8db5202605a7a54b719ded5e4') { throw "Build-kit hash mismatch: $actualKitHash" }
-          Expand-Archive -LiteralPath kit.zip -DestinationPath kit -Force
+          $part = 'crusader-v038/kit-part-000.b64'
+          if (-not (Test-Path -LiteralPath $part)) { throw 'Build-kit payload not found.' }
+          $encoded = (Get-Content -LiteralPath $part -Raw).Trim()
+          [IO.File]::WriteAllBytes('kit-core.zip', [Convert]::FromBase64String($encoded))
+          $actualKitHash = (Get-FileHash kit-core.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualKitHash -ne 'acee9170aa51a2b3e524a9b2ed16b1019b89271fbed26542a46dc51b1a6e223') { throw "Build-kit hash mismatch: $actualKitHash" }
+          Expand-Archive -LiteralPath kit-core.zip -DestinationPath kit-extracted -Force
+          Move-Item -LiteralPath kit-extracted/crusader_v038_build_core -Destination kit
           if (-not (Test-Path -LiteralPath kit/apply_coop_patch.py)) { throw 'Build kit reconstruction failed.' }
-          Get-FileHash kit.zip -Algorithm SHA256
+          Get-FileHash kit-core.zip -Algorithm SHA256
 
       - name: Checkout ScummVM v2026.3.0
         uses: actions/checkout@v4
@@ -174,9 +172,9 @@ jobs:
           Copy-Item kit/v038-ai.patch $sourcePatch
           Copy-Item kit/patch_files $sourcePatch -Recurse
           Copy-Item kit/tests/test_v038_enemy_combat.py "$sourcePatch/tests/test_v038_enemy_combat.py"
-          Copy-Item kit/diagnostics "$sourcePatch/diagnostics" -Recurse
-          Copy-Item kit/TECHNICAL-NOTES.md $sourcePatch
-          Copy-Item kit/AI-COMBAT-FIX-v0.3.8.txt $sourcePatch
+          if (Test-Path kit/diagnostics) { Copy-Item kit/diagnostics "$sourcePatch/diagnostics" -Recurse }
+          if (Test-Path kit/TECHNICAL-NOTES.md) { Copy-Item kit/TECHNICAL-NOTES.md $sourcePatch }
+          if (Test-Path kit/AI-COMBAT-FIX-v0.3.8.txt) { Copy-Item kit/AI-COMBAT-FIX-v0.3.8.txt $sourcePatch }
           foreach ($name in @('COPYING','README-SV.md','BUILD-GITHUB-SV.md','BUILD-INFO-SV.txt','CHANGELOG.md','THIRD-PARTY-NOTICE.md','TEST-RESULTS.txt','SOURCE-MANIFEST.txt','VERSION.txt','AI-COMBAT-FIX-v0.3.8.txt')) {
             if (Test-Path "kit/$name") { Copy-Item "kit/$name" $package -Force }
           }

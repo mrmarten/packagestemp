@@ -1,0 +1,172 @@
+name: Build Crusader Co-op v0.3.7 fixed
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-crusader-v037-fixed.yml'
+      - 'crusader-v037/chunk-00'
+      - 'crusader-v037/chunk-01a'
+      - 'crusader-v037/chunk-01b1'
+      - 'crusader-v037/chunk-01b2'
+      - 'crusader-v037/chunk-02'
+      - 'crusader-v037/chunk-03'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 240
+    env:
+      CONFIGURATION: Release
+      PLATFORM: x64
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+      VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_cache,readwrite
+      VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/scummvm-src/.github/vcpkg-ports
+      GIT_VCPKG_COMMIT: ef7dbf94b9198bc58f45951adcf1f041fcbc5ea0
+
+    steps:
+      - name: Checkout build payload
+        uses: actions/checkout@v4
+
+      - name: Reconstruct and verify co-op patch kit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $chunkFiles = @(
+            'crusader-v037/chunk-00',
+            'crusader-v037/chunk-01a',
+            'crusader-v037/chunk-01b1',
+            'crusader-v037/chunk-01b2',
+            'crusader-v037/chunk-02',
+            'crusader-v037/chunk-03'
+          )
+          $base64 = (($chunkFiles | ForEach-Object { Get-Content -LiteralPath $_ -Raw }) -join '')
+          [IO.File]::WriteAllText('source-patch.b64', $base64, [Text.Encoding]::ASCII)
+          $base64Hash = (Get-FileHash source-patch.b64 -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($base64Hash -ne '7d0124f33fe974c08261b745c0ce2dae5a25b8711906fc5b0accab212ce04d5b') {
+            throw "Base64 payload hash mismatch: $base64Hash"
+          }
+          [IO.File]::WriteAllBytes('source-patch.zip', [Convert]::FromBase64String($base64))
+          $zipHash = (Get-FileHash source-patch.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($zipHash -ne '5c6ddf230c34802017d2a60989ffa47b532f0e0d2829f52524ef7b68139b158e') {
+            throw "Patch ZIP hash mismatch: $zipHash"
+          }
+          Expand-Archive source-patch.zip -DestinationPath support -Force
+          if (-not (Test-Path support/bundle/apply_coop_patch.py)) { throw 'Patch script missing.' }
+
+      - name: Checkout ScummVM v2026.3.0
+        uses: actions/checkout@v4
+        with:
+          repository: scummvm/scummvm
+          ref: v2026.3.0
+          path: scummvm-src
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply Crusader co-op v0.3.7 patch
+        shell: pwsh
+        run: |
+          python -m py_compile support/bundle/apply_coop_patch.py
+          python support/bundle/apply_coop_patch.py scummvm-src --package-root support/bundle
+          if ($LASTEXITCODE -ne 0) { throw "Patch failed with $LASTEXITCODE" }
+          Select-String -LiteralPath scummvm-src/engines/ultima/ultima8/world/actors/cru_coop_mover_process.cpp -SimpleMatch 'updateEnemyAwareness' | Out-Null
+          Select-String -LiteralPath scummvm-src/engines/ultima/ultima8/world/actors/actor.cpp -SimpleMatch 'canSeeActorForCoop' | Out-Null
+          git -C scummvm-src add -N engines/ultima/ultima8/world/actors/cru_coop_mover_process.cpp engines/ultima/ultima8/world/actors/cru_coop_mover_process.h .crusader-coop-patch
+          git -C scummvm-src diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Patched source has whitespace errors.' }
+
+      - name: Install vcpkg
+        uses: lukka/run-vcpkg@v11
+        id: runvcpkg
+        with:
+          vcpkgGitCommitId: ${{ env.GIT_VCPKG_COMMIT }}
+
+      - name: Integrate vcpkg
+        shell: pwsh
+        run: '& "${{ steps.runvcpkg.outputs.RUNVCPKG_VCPKG_ROOT_OUT }}/vcpkg" integrate install'
+
+      - name: Restore vcpkg cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_cache
+          key: crusader-v037-vcpkg-${{ env.GIT_VCPKG_COMMIT }}-x64-${{ hashFiles('scummvm-src/vcpkg.json') }}
+          restore-keys: |
+            crusader-v037-vcpkg-${{ env.GIT_VCPKG_COMMIT }}-x64-
+            coop-vcpkg-${{ env.GIT_VCPKG_COMMIT }}-x64-
+
+      - name: Build create_project
+        working-directory: scummvm-src/devtools/create_project/cmake
+        shell: pwsh
+        run: |
+          cmake .
+          cmake --build . --config Debug -j 2
+          if ($LASTEXITCODE -ne 0) { throw "create_project build failed with $LASTEXITCODE" }
+
+      - name: Generate Visual Studio solution
+        working-directory: scummvm-src
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path build-scummvm -Force | Out-Null
+          Push-Location build-scummvm
+          & ../devtools/create_project/cmake/Debug/create_project.exe .. --msvc --vcpkg --disable-translation --disable-all-engines --enable-engine=ultima8 --enable-freetype2 --enable-faad --enable-gif --enable-mikmod --enable-mpeg2 --enable-vpx
+          if ($LASTEXITCODE -ne 0) { throw "create_project failed with $LASTEXITCODE" }
+          Pop-Location
+          $freeTypeDefinition = Get-ChildItem build-scummvm -Recurse -Include '*.props','*.vcxproj' -File | Select-String -SimpleMatch 'USE_FREETYPE2' | Select-Object -First 1
+          if (-not $freeTypeDefinition) { throw 'Generated project does not define USE_FREETYPE2.' }
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install vcpkg packages
+        working-directory: scummvm-src
+        shell: pwsh
+        run: |
+          vcpkg install
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed with $LASTEXITCODE" }
+
+      - name: Save vcpkg cache
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_cache
+          key: crusader-v037-vcpkg-${{ env.GIT_VCPKG_COMMIT }}-x64-${{ hashFiles('scummvm-src/vcpkg.json') }}
+
+      - name: Build ScummVM
+        working-directory: scummvm-src/build-scummvm
+        shell: pwsh
+        run: |
+          msbuild scummvm.sln /m /p:VcpkgEnableManifest=true /p:BuildInParallel=true /p:Configuration=${{ env.CONFIGURATION }} /p:PreferredToolArchitecture=x64 /p:Platform=${{ env.PLATFORM }} /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with $LASTEXITCODE" }
+
+      - name: Package compiled runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $builtExe = Get-ChildItem scummvm-src/build-scummvm -Recurse -Filter scummvm.exe | Where-Object { $_.FullName -notmatch 'vcpkg' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $builtExe) { throw 'Built scummvm.exe not found.' }
+          New-Item -ItemType Directory -Path built-runtime -Force | Out-Null
+          Copy-Item $builtExe.FullName built-runtime/crusader-coop.exe -Force
+          Copy-Item scummvm-src/dists/engine-data/fonts.dat built-runtime/fonts.dat -Force
+          Copy-Item scummvm-src/dists/engine-data/ultima8.dat built-runtime/ultima8.dat -Force
+          $dllDir = Join-Path $env:VCPKG_INSTALLED_DIR 'x64-windows/bin'
+          if (Test-Path -LiteralPath $dllDir) { Get-ChildItem -LiteralPath $dllDir -Filter '*.dll' -File | Copy-Item -Destination built-runtime -Force }
+          git -C scummvm-src diff --binary --output='../built-runtime/scummvm-v2026.3.0-coop-v0.3.7.patch'
+          $exeHash = (Get-FileHash built-runtime/crusader-coop.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content built-runtime/BUILD-RESULT.txt @('CrusaderCoop v0.3.7', "EXE_SHA256=$exeHash", 'PATCH_PAYLOAD_SHA256=5c6ddf230c34802017d2a60989ffa47b532f0e0d2829f52524ef7b68139b158e', 'SCUMMVM_TAG=v2026.3.0', 'FREETYPE2=enabled') -Encoding ascii
+          Get-ChildItem built-runtime -File | ForEach-Object { $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); "$hash  $($_.Name)" } | Set-Content built-runtime/SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload compiled runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: crusader-coop-v0.3.7-built-runtime
+          path: built-runtime/**
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30

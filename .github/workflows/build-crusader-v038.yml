@@ -1,0 +1,219 @@
+name: Build Crusader co-op v0.3.8
+
+on:
+  push:
+    branches:
+      - crusader-v038-build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      CONFIGURATION: Release
+      PLATFORM: x64
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+      VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_cache,readwrite
+      VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/scummvm-src/.github/vcpkg-ports
+      GIT_VCPKG_COMMIT: ef7dbf94b9198bc58f45951adcf1f041fcbc5ea0
+
+    steps:
+      - name: Checkout compact v0.3.8 build kit
+        uses: actions/checkout@v4
+
+      - name: Reconstruct build kit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parts = Get-ChildItem -LiteralPath crusader-v038 -Filter 'kit-part-*.b64' -File | Sort-Object Name
+          if (-not $parts -or $parts.Count -eq 0) { throw 'No build-kit chunks found.' }
+          $builder = [System.Text.StringBuilder]::new()
+          foreach ($part in $parts) {
+            [void]$builder.Append((Get-Content -LiteralPath $part.FullName -Raw).Trim())
+          }
+          [IO.File]::WriteAllBytes('kit.zip', [Convert]::FromBase64String($builder.ToString()))
+          $actualKitHash = (Get-FileHash kit.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualKitHash -ne '356aec72cbd08894ebdfce89725283df3cdab6f8db5202605a7a54b719ded5e4') { throw "Build-kit hash mismatch: $actualKitHash" }
+          Expand-Archive -LiteralPath kit.zip -DestinationPath kit -Force
+          if (-not (Test-Path -LiteralPath kit/apply_coop_patch.py)) { throw 'Build kit reconstruction failed.' }
+          Get-FileHash kit.zip -Algorithm SHA256
+
+      - name: Checkout ScummVM v2026.3.0
+        uses: actions/checkout@v4
+        with:
+          repository: scummvm/scummvm
+          ref: v2026.3.0
+          path: scummvm-src
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply v0.3.7 base co-op patch
+        run: python kit/apply_coop_patch.py scummvm-src --package-root kit
+
+      - name: Apply and validate v0.3.8 enemy combat repair
+        shell: pwsh
+        run: |
+          git -C scummvm-src apply --check ../kit/v038-ai.patch
+          git -C scummvm-src apply ../kit/v038-ai.patch
+          python kit/tests/test_v038_enemy_combat.py scummvm-src
+          git -C scummvm-src add -N engines/ultima/ultima8/world/actors/cru_coop_mover_process.cpp engines/ultima/ultima8/world/actors/cru_coop_mover_process.h .crusader-coop-patch
+          git -C scummvm-src diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Patched source has whitespace errors.' }
+
+      - name: Install vcpkg
+        uses: lukka/run-vcpkg@v11
+        id: runvcpkg
+        with:
+          vcpkgGitCommitId: ${{ env.GIT_VCPKG_COMMIT }}
+
+      - name: Integrate vcpkg
+        shell: pwsh
+        run: '& "${{ steps.runvcpkg.outputs.RUNVCPKG_VCPKG_ROOT_OUT }}/vcpkg" integrate install'
+
+      - name: Restore vcpkg cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_cache
+          key: coop-v038-${{ env.GIT_VCPKG_COMMIT }}-x64-${{ hashFiles('scummvm-src/vcpkg.json', 'vcpkg_installed/compiler-file-hash-cache.json', 'vcpkg_installed/status') }}
+          restore-keys: |
+            coop-v038-${{ env.GIT_VCPKG_COMMIT }}-x64-
+            coop-vcpkg-${{ env.GIT_VCPKG_COMMIT }}-x64-
+
+      - name: Build create_project
+        working-directory: scummvm-src/devtools/create_project/cmake
+        run: |
+          cmake .
+          cmake --build . -j 2
+
+      - name: Generate Visual Studio solution
+        working-directory: scummvm-src
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path build-scummvm -Force | Out-Null
+          Push-Location build-scummvm
+          & ../devtools/create_project/cmake/Debug/create_project.exe .. --msvc --vcpkg --disable-translation --disable-all-engines --enable-engine=ultima8 --enable-freetype2 --enable-faad --enable-gif --enable-mikmod --enable-mpeg2 --enable-vpx
+          if ($LASTEXITCODE -ne 0) { throw "create_project failed with $LASTEXITCODE" }
+          Pop-Location
+          $freeTypeDefinition = Get-ChildItem build-scummvm -Recurse -Include '*.props','*.vcxproj' -File |
+            Select-String -SimpleMatch 'USE_FREETYPE2' | Select-Object -First 1
+          if (-not $freeTypeDefinition) { throw 'Generated project does not define USE_FREETYPE2.' }
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install vcpkg packages
+        working-directory: scummvm-src
+        run: vcpkg install
+
+      - name: Save vcpkg cache
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_cache
+          key: coop-v038-${{ env.GIT_VCPKG_COMMIT }}-x64-${{ hashFiles('scummvm-src/vcpkg.json', 'vcpkg_installed/compiler-file-hash-cache.json', 'vcpkg_installed/status') }}
+
+      - name: Build ScummVM
+        working-directory: scummvm-src/build-scummvm
+        run: msbuild scummvm.sln /m /p:VcpkgEnableManifest=true /p:BuildInParallel=true /p:Configuration=${{ env.CONFIGURATION }} /p:PreferredToolArchitecture=x64 /p:Platform=${{ env.PLATFORM }} /v:minimal
+
+      - name: Package v0.3.8 Windows runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runtimeUrl = 'https://downloads.scummvm.org/frs/scummvm/2026.3.0/scummvm-2026.3.0-win32-x86_64.zip'
+          $runtimeSha = 'ba0af3fd6cf0d281c623d48b23c77a4b4775860d496195155e6ceb281e0fff95'
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Invoke-WebRequest -Uri $runtimeUrl -OutFile dist/scummvm-runtime.zip
+          $actual = (Get-FileHash dist/scummvm-runtime.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $runtimeSha) { throw "Runtime hash mismatch: $actual" }
+          Expand-Archive dist/scummvm-runtime.zip -DestinationPath dist/runtime-official -Force
+
+          $officialExe = Get-ChildItem dist/runtime-official -Recurse -Filter scummvm.exe | Select-Object -First 1
+          if (-not $officialExe) { throw 'Official scummvm.exe not found.' }
+          $builtExe = Get-ChildItem scummvm-src/build-scummvm -Recurse -Filter scummvm.exe |
+            Where-Object { $_.FullName -notmatch 'vcpkg' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $builtExe) { throw 'Built scummvm.exe not found.' }
+
+          $package = 'dist/CrusaderCoop-v0.3.8-Windows-x64'
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Copy-Item "$($officialExe.Directory.FullName)/*" $package -Recurse -Force
+          Remove-Item "$package/scummvm.exe" -Force
+          Copy-Item $builtExe.FullName "$package/crusader-coop.exe" -Force
+
+          $engineDataHashes = [ordered]@{
+            'fonts.dat' = 'b25946aa6ff9c7bbef9d6e5a8fa7b33cf1230fbddfaa5262e19288387c493b95'
+            'ultima8.dat' = 'eb00526c19ff1d878754f27632c29bfecdb9c906764fc4328d76bb708146f4fc'
+          }
+          foreach ($engineDataName in $engineDataHashes.Keys) {
+            $source = "scummvm-src/dists/engine-data/$engineDataName"
+            $sourceHash = (Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($sourceHash -ne $engineDataHashes[$engineDataName]) { throw "$engineDataName hash mismatch." }
+            Copy-Item $source "$package/$engineDataName" -Force
+          }
+
+          $builtDllDir = Join-Path $env:VCPKG_INSTALLED_DIR 'x64-windows/bin'
+          if (Test-Path $builtDllDir) {
+            Get-ChildItem $builtDllDir -Filter '*.dll' -File | Copy-Item -Destination $package -Force
+          }
+
+          Copy-Item 'kit/runtime/*' $package -Recurse -Force
+          New-Item -ItemType Directory -Path "$package/saves" -Force | Out-Null
+
+          $sourcePatch = "$package/source-patch"
+          New-Item -ItemType Directory -Path "$sourcePatch/tests" -Force | Out-Null
+          Copy-Item kit/apply_coop_patch.py $sourcePatch
+          Copy-Item kit/v038-ai.patch $sourcePatch
+          Copy-Item kit/patch_files $sourcePatch -Recurse
+          Copy-Item kit/tests/test_v038_enemy_combat.py "$sourcePatch/tests/test_v038_enemy_combat.py"
+          Copy-Item kit/diagnostics "$sourcePatch/diagnostics" -Recurse
+          Copy-Item kit/TECHNICAL-NOTES.md $sourcePatch
+          Copy-Item kit/AI-COMBAT-FIX-v0.3.8.txt $sourcePatch
+          foreach ($name in @('COPYING','README-SV.md','BUILD-GITHUB-SV.md','BUILD-INFO-SV.txt','CHANGELOG.md','THIRD-PARTY-NOTICE.md','TEST-RESULTS.txt','SOURCE-MANIFEST.txt','VERSION.txt','AI-COMBAT-FIX-v0.3.8.txt')) {
+            if (Test-Path "kit/$name") { Copy-Item "kit/$name" $package -Force }
+          }
+
+          git -C scummvm-src diff --binary --output="../$sourcePatch/scummvm-v2026.3.0-coop-v0.3.8.patch"
+          python kit/build/generate_runtime_checksums.py $package
+
+          $runtimeZip = 'dist/CrusaderCoop-v0.3.8-Windows-x64.zip'
+          Compress-Archive "$package/*" $runtimeZip -CompressionLevel Optimal
+          $hash = (Get-FileHash $runtimeZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content "$runtimeZip.sha256" "$hash  $([IO.Path]::GetFileName($runtimeZip))" -Encoding ascii
+          Get-Item $runtimeZip
+          Get-FileHash $runtimeZip -Algorithm SHA256
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: CrusaderCoop-v0.3.8-Windows-x64
+          path: |
+            dist/CrusaderCoop-v0.3.8-Windows-x64.zip
+            dist/CrusaderCoop-v0.3.8-Windows-x64.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload full patched source
+        uses: actions/upload-artifact@v4
+        with:
+          name: CrusaderCoop-v0.3.8-Full-Source
+          path: |
+            scummvm-src/**
+            !scummvm-src/.git/**
+            !scummvm-src/build-scummvm/**
+            !scummvm-src/devtools/create_project/cmake/Debug/**
+            !scummvm-src/devtools/create_project/cmake/CMakeFiles/**
+            !scummvm-src/devtools/create_project/cmake/CMakeCache.txt
+            !scummvm-src/devtools/create_project/cmake/*.sln
+            !scummvm-src/devtools/create_project/cmake/*.vcxproj*
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30

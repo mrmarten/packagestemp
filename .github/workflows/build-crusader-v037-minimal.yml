@@ -60,10 +60,13 @@ jobs:
               "faad2",
               "freetype",
               "giflib",
+              "libflac",
               "libjpeg-turbo",
+              "libmad",
               "libmikmod",
               "libmpeg2",
               "libpng",
+              "libvorbis",
               "libvpx",
               "sdl2",
               "zlib"
@@ -136,7 +139,7 @@ jobs:
           if (Test-Path $dllDir) { Get-ChildItem $dllDir -Filter '*.dll' -File | Copy-Item -Destination built-runtime -Force }
           git -C scummvm-src diff --binary --output='../built-runtime/scummvm-v2026.3.0-coop-v0.3.7.patch'
           $hash = (Get-FileHash built-runtime/crusader-coop.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content built-runtime/BUILD-RESULT.txt @('CrusaderCoop v0.3.7',"EXE_SHA256=$hash",'SCUMMVM_TAG=v2026.3.0','FREETYPE2=enabled','MANIFEST=minimal') -Encoding ascii
+          Set-Content built-runtime/BUILD-RESULT.txt @('CrusaderCoop v0.3.7',"EXE_SHA256=$hash",'SCUMMVM_TAG=v2026.3.0','FREETYPE2=enabled','MANIFEST=minimal-plus-audio') -Encoding ascii
           Get-ChildItem built-runtime -File | ForEach-Object { "$( (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() )  $($_.Name)" } | Set-Content built-runtime/SHA256SUMS.txt -Encoding ascii
 
       - uses: actions/upload-artifact@v4

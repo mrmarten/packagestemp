@@ -1,0 +1,93 @@
+name: Validate exact TFE Co-op M4.2.2 Windows launcher
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode and checksum exact launcher
+        shell: pwsh
+        run: |
+          $encoded = (Get-Content m422-launcher/Start-TFE-Coop-Local.ps1.xz.b64 -Raw) -replace '\s',''
+          [IO.File]::WriteAllBytes('launcher.xz', [Convert]::FromBase64String($encoded))
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          source = lzma.decompress(Path('launcher.xz').read_bytes())
+          expected = '2d84085648a1b055d75d5708fe0c9c42946d213691d4a0f4b99bb6bae6e93855'
+          actual = hashlib.sha256(source).hexdigest()
+          if actual != expected:
+              raise SystemExit(f'launcher checksum mismatch: {actual}')
+          Path('Start-TFE-Coop-Local.ps1').write_bytes(source)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher decode/checksum failed.' }
+          New-Item -ItemType File -Path .\theforceengine.exe -Force | Out-Null
+
+      - name: Parse and inspect with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\Start-TFE-Coop-Local.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Force
+            throw 'Windows PowerShell 5.1 parser reported launcher errors.'
+          }
+          $text = Get-Content .\Start-TFE-Coop-Local.ps1 -Raw
+          foreach ($required in @(
+            "Version = '4.2.2'",
+            '[int]$ConnectionTimeoutSeconds = 45',
+            'starting Client without waiting for log flush',
+            'Start-Sleep -Milliseconds 350',
+            'Synchronization wait {0}s:',
+            '--coop-wait-for-peer',
+            '--disable-controller',
+            '--mute-music',
+            '--widescreen'
+          )) {
+            if (-not $text.Contains($required)) { throw "Required launcher marker absent: $required" }
+          }
+          foreach ($forbidden in @('Host listener ready:', 'Static MSVC supervisor active', '$controllerProfile:')) {
+            if ($text.Contains($forbidden)) { throw "Forbidden launcher regression remains: $forbidden" }
+          }
+          Write-Host 'Windows PowerShell 5.1 parsing and source guards: PASS'
+
+      - name: Execute every non-launching layout and input preflight
+        shell: powershell
+        run: |
+          foreach ($layout in @('Vertical','Horizontal')) {
+            foreach ($mode in @('KeyboardController','ControllerKeyboard','TwoControllers')) {
+              $output = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+                -File .\Start-TFE-Coop-Local.ps1 -Layout $layout -InputMode $mode -PreflightOnly 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                $output | ForEach-Object { Write-Host $_ }
+                throw "Preflight failed: $layout / $mode"
+              }
+              $json = $output | Where-Object { "$_" -match '^\{.*\}$' } | Select-Object -Last 1
+              if (-not $json) { throw "No preflight JSON: $layout / $mode" }
+              $data = $json | ConvertFrom-Json
+              if ($data.Version -ne '4.2.2') { throw "Wrong version: $($data.Version)" }
+              if ([int]$data.ConnectionTimeoutSeconds -ne 45) { throw 'Wrong synchronization timeout.' }
+              if (-not [bool]$data.PeerBarrierEnabled) { throw 'Campaign peer barrier is disabled.' }
+              if ($data.HostArguments -notmatch '--coop-host' -or $data.HostArguments -notmatch '--coop-wait-for-peer') { throw 'Host arguments are incomplete.' }
+              if ($data.ClientArguments -notmatch '--coop-connect 127\.0\.0\.1' -or $data.ClientArguments -notmatch '--coop-wait-for-peer') { throw 'Client arguments are incomplete.' }
+              if ($mode -eq 'KeyboardController') {
+                if (-not [bool]$data.HostControllerDisabled) { throw 'Host controller must be disabled in keyboard/controller mode.' }
+                if ([int]$data.ClientController -ne 0) { throw 'Client controller index must be 0.' }
+                if (-not [bool]$data.ClientMusicMuted) { throw 'Client music must be muted by default.' }
+              }
+            }
+          }
+          Write-Host 'All left/right and top/bottom preflights: PASS'

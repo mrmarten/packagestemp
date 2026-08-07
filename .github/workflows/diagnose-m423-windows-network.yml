@@ -1,0 +1,119 @@
+name: Diagnose TFE Co-op Windows localhost handshake
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  ENGINE_BUILD_RUN_ID: 30912531657
+  ENGINE_ARTIFACT_NAME: TFE-Coop-Milestone-4.2.2-MSVC-x64-self-contained
+  TEST_PORT: 39777
+
+jobs:
+  windows-localhost:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download exact Milestone 4.2.2 native engine artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force engine | Out-Null
+          gh run download $env:ENGINE_BUILD_RUN_ID --repo $env:GITHUB_REPOSITORY `
+            --name $env:ENGINE_ARTIFACT_NAME --dir engine
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download the exact native engine artifact.' }
+          if (-not (Test-Path engine\theforceengine.exe -PathType Leaf)) { throw 'Engine executable is missing.' }
+          Get-FileHash engine\theforceengine.exe -Algorithm SHA256
+
+      - name: Launch exact Host and Client command lines and inspect localhost UDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $documents = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+          $hostProfile = 'DiagHost'
+          $clientProfile = 'DiagClient'
+          $hostDir = Join-Path $documents "TheForceEngine-Coop-$hostProfile"
+          $clientDir = Join-Path $documents "TheForceEngine-Coop-$clientProfile"
+          Remove-Item $hostDir,$clientDir -Recurse -Force -ErrorAction SilentlyContinue
+
+          $exe = (Resolve-Path engine\theforceengine.exe).Path
+          $working = (Resolve-Path engine).Path
+          $hostArgs = "--game DARK --coop-host $env:TEST_PORT --coop-name Host --coop-profile $hostProfile --coop-debug --coop-wait-for-peer --disable-controller --nosound --borderless-window --split-display 0 --split-window horizontal 0"
+          $clientArgs = "--game DARK --coop-connect 127.0.0.1 $env:TEST_PORT --coop-name Client --coop-profile $clientProfile --coop-debug --coop-wait-for-peer --disable-controller --nosound --borderless-window --split-display 0 --split-window horizontal 1"
+
+          Write-Host "HOST ARGS: $hostArgs"
+          Write-Host "CLIENT ARGS: $clientArgs"
+          $hostProcess = Start-Process -FilePath $exe -ArgumentList $hostArgs -WorkingDirectory $working -PassThru
+          Start-Sleep -Milliseconds 500
+          $clientProcess = Start-Process -FilePath $exe -ArgumentList $clientArgs -WorkingDirectory $working -PassThru
+
+          try {
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Milliseconds 250
+              $hostProcess.Refresh(); $clientProcess.Refresh()
+              if ($hostProcess.HasExited -or $clientProcess.HasExited) { break }
+              if (($i % 8) -eq 0) {
+                Write-Host "--- elapsed $([math]::Round(($i + 1) * 0.25, 2)) s ---"
+                Get-CimInstance Win32_Process -Filter "ProcessId=$($hostProcess.Id) OR ProcessId=$($clientProcess.Id)" |
+                  Select-Object ProcessId,CommandLine | Format-List | Out-String | Write-Host
+                Get-NetUDPEndpoint -ErrorAction SilentlyContinue |
+                  Where-Object { $_.OwningProcess -in @($hostProcess.Id,$clientProcess.Id) -or $_.LocalPort -eq [int]$env:TEST_PORT } |
+                  Sort-Object LocalPort,OwningProcess | Format-Table -AutoSize | Out-String | Write-Host
+              }
+            }
+
+            $hostProcess.Refresh(); $clientProcess.Refresh()
+            $hostCode = if ($hostProcess.HasExited) { [string]$hostProcess.ExitCode } else { 'running' }
+            $clientCode = if ($clientProcess.HasExited) { [string]$clientProcess.ExitCode } else { 'running' }
+            Write-Host "Host exited=$($hostProcess.HasExited) code=$hostCode"
+            Write-Host "Client exited=$($clientProcess.HasExited) code=$clientCode"
+
+            $hostLog = Join-Path $hostDir "the_force_engine_log_$hostProfile.txt"
+            $clientLog = Join-Path $clientDir "the_force_engine_log_$clientProfile.txt"
+            Write-Host "HOST LOG PATH: $hostLog"
+            if (Test-Path $hostLog) { Get-Content $hostLog -Raw | Write-Host } else { Write-Host '<host log absent>' }
+            Write-Host "CLIENT LOG PATH: $clientLog"
+            if (Test-Path $clientLog) { Get-Content $clientLog -Raw | Write-Host } else { Write-Host '<client log absent>' }
+
+            New-Item -ItemType Directory -Force diagnostic-output | Out-Null
+            if (Test-Path $hostLog) { Copy-Item $hostLog diagnostic-output\host.log }
+            if (Test-Path $clientLog) { Copy-Item $clientLog diagnostic-output\client.log }
+            Get-CimInstance Win32_Process -Filter "ProcessId=$($hostProcess.Id) OR ProcessId=$($clientProcess.Id)" |
+              Select-Object ProcessId,CommandLine | Format-List | Out-String | Set-Content diagnostic-output\command-lines.txt
+            Get-NetUDPEndpoint -ErrorAction SilentlyContinue |
+              Where-Object { $_.OwningProcess -in @($hostProcess.Id,$clientProcess.Id) -or $_.LocalPort -eq [int]$env:TEST_PORT } |
+              Sort-Object LocalPort,OwningProcess | Format-Table -AutoSize | Out-String | Set-Content diagnostic-output\udp-endpoints.txt
+
+            if (-not (Test-Path $hostLog) -or -not (Test-Path $clientLog)) { throw 'One or both profile logs were not created.' }
+            $hostText = Get-Content $hostLog -Raw
+            $clientText = Get-Content $clientLog -Raw
+            foreach ($needle in @('Parsing parameter --coop-host','Hosting on UDP port','Connection state: connected')) {
+              if ($hostText -notmatch [regex]::Escape($needle)) { throw "Host log missing: $needle" }
+            }
+            foreach ($needle in @('Parsing parameter --coop-connect','Connecting on UDP port','Connection state: connected')) {
+              if ($clientText -notmatch [regex]::Escape($needle)) { throw "Client log missing: $needle" }
+            }
+            Write-Host 'Full-engine Windows localhost handshake: PASS'
+          }
+          finally {
+            foreach ($process in @($hostProcess,$clientProcess)) {
+              if ($process) {
+                try { $process.Refresh(); if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force } } catch {}
+              }
+            }
+          }
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m423-windows-network-diagnostics
+          path: diagnostic-output/
+          if-no-files-found: ignore
+          retention-days: 7

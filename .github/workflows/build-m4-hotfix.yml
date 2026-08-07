@@ -1,0 +1,162 @@
+name: Build TFE Co-op M4.1 hotfix
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TFE_SHA: 54eab324e9b265c503b51c3690f030f42a0f9fcc
+  B64_SHA256: 5776428a7e95b65fe6f1e6b07de20804b52fdca392ed101e11f634c850315ebf
+  XZ_SHA256: 90153819419367b0370692b3f5baa248589c4014028735443be44d14c3b5cb73
+  PATCH_SHA256: 30bef404bff1fac4cab737a71e33760888fcfd959b6a19a40588a39c72123951
+
+jobs:
+  linux:
+    name: Linux x64 build and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct and apply exact cumulative patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat patches/m4-hotfix-v2/part-*.txt > hotfix.patch.xz.b64
+          test "$(sha256sum hotfix.patch.xz.b64 | awk '{print $1}')" = "$B64_SHA256"
+          base64 --decode hotfix.patch.xz.b64 > hotfix.patch.xz
+          test "$(sha256sum hotfix.patch.xz | awk '{print $1}')" = "$XZ_SHA256"
+          xz --test hotfix.patch.xz
+          xz --decompress --stdout hotfix.patch.xz > hotfix.patch
+          test "$(sha256sum hotfix.patch | awk '{print $1}')" = "$PATCH_SHA256"
+          git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
+          git -C tfe checkout "$TFE_SHA"
+          git -C tfe apply --check "$GITHUB_WORKSPACE/hotfix.patch"
+          git -C tfe apply "$GITHUB_WORKSPACE/hotfix.patch"
+          git -C tfe diff --check
+
+      - name: Run protocol and sanitizer tests when present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -x tfe/tests/coop/build_and_run.sh ]; then
+            tfe/tests/coop/build_and_run.sh
+            COOP_TEST_BUILD_DIR="$PWD/tfe/build/coop-tests-sanitized" COOP_SANITIZE=1 tfe/tests/coop/build_and_run.sh
+          else
+            echo "The cumulative patch does not include the standalone coop test harness; continuing to the full-engine build."
+          fi
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev libsdl2-image-dev
+
+      - name: Configure and build Linux x64
+        shell: bash
+        run: |
+          cmake -S tfe -B build-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_SYSMIDI=OFF \
+            -DENABLE_EDITOR=OFF \
+            -DENABLE_OGV_CUTSCENES=OFF
+          cmake --build build-linux --parallel 2
+          rm -rf install-linux
+          cmake --install build-linux --prefix "$PWD/install-linux"
+          find install-linux -maxdepth 4 -type f -print
+
+      - name: Package Linux and source artifacts
+        shell: bash
+        run: |
+          cp hotfix.patch install-linux/TFE-Coop-Milestone-4.1-Hotfix.patch
+          cp tfe/COOP_README.md tfe/MILESTONE4_RELEASE_NOTES.md tfe/LICENSE install-linux/
+          tar -C install-linux -czf TFE-Coop-Milestone-4.1-Linux-build.tar.gz .
+          git -C tfe add -A
+          git -C tfe -c user.name='TFE Co-op Build' -c user.email='build@invalid.local' commit -m 'TFE Co-op Milestone 4.1 hotfix'
+          git -C tfe archive --format=zip --prefix=TFE-Coop-Milestone-4.1-Source/ HEAD > TFE-Coop-Milestone-4.1-Source.zip
+          sha256sum TFE-Coop-Milestone-4.1-Linux-build.tar.gz TFE-Coop-Milestone-4.1-Source.zip hotfix.patch > SHA256SUMS-linux.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-4.1-Linux
+          path: |
+            TFE-Coop-Milestone-4.1-Linux-build.tar.gz
+            SHA256SUMS-linux.txt
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-4.1-Source
+          path: |
+            TFE-Coop-Milestone-4.1-Source.zip
+            hotfix.patch
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64 build
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Reconstruct and apply exact cumulative patch
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem patches/m4-hotfix-v2/part-*.txt | Sort-Object Name
+          $text = ($parts | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join ''
+          [IO.File]::WriteAllText('hotfix.patch.xz.b64', $text, [Text.UTF8Encoding]::new($false))
+          $b64Hash = (Get-FileHash hotfix.patch.xz.b64 -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($b64Hash -ne $env:B64_SHA256) { throw "Base64 checksum mismatch: $b64Hash" }
+          [IO.File]::WriteAllBytes('hotfix.patch.xz', [Convert]::FromBase64String($text))
+          $xzHash = (Get-FileHash hotfix.patch.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($xzHash -ne $env:XZ_SHA256) { throw "XZ checksum mismatch: $xzHash" }
+          @'
+          import lzma
+          from pathlib import Path
+          Path('hotfix.patch').write_bytes(lzma.decompress(Path('hotfix.patch.xz').read_bytes()))
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Python lzma decompression failed' }
+          $patchHash = (Get-FileHash hotfix.patch -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($patchHash -ne $env:PATCH_SHA256) { throw "Patch checksum mismatch: $patchHash" }
+          git clone https://github.com/TheForceEngine/TheForceEngine.git tfe
+          git -C tfe checkout $env:TFE_SHA
+          git -C tfe apply --check (Resolve-Path hotfix.patch)
+          git -C tfe apply (Resolve-Path hotfix.patch)
+          git -C tfe diff --check
+
+      - name: Build Windows x64
+        shell: pwsh
+        run: |
+          msbuild tfe\TheForceEngine.sln /m /restore `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:PlatformToolset=v143 `
+            /p:WindowsTargetPlatformVersion=10.0
+
+      - name: Collect Windows binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force windows-output | Out-Null
+          $engine = Get-ChildItem -Path tfe -Recurse -Filter theforceengine.exe |
+            Where-Object { $_.FullName -match '\\x64\\Release\\' } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+          if (-not $engine) { throw 'The Force Engine Windows executable was not found.' }
+          $split = Get-ChildItem -Path tfe -Recurse -Filter tfe_coop_splitscreen.exe |
+            Where-Object { $_.FullName -match '\\x64\\Release\\' } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+          Copy-Item $engine.FullName windows-output\theforceengine.exe
+          if ($split) { Copy-Item $split.FullName windows-output\tfe_coop_splitscreen.exe }
+          Copy-Item hotfix.patch windows-output\TFE-Coop-Milestone-4.1-Hotfix.patch
+          Copy-Item tfe\COOP_README.md,tfe\MILESTONE4_RELEASE_NOTES.md,tfe\LICENSE windows-output
+          Get-FileHash windows-output\*.exe -Algorithm SHA256 | Format-Table -AutoSize | Out-File windows-output\WINDOWS-BUILD-SHA256.txt
+          Compress-Archive -Path windows-output\* -DestinationPath TFE-Coop-Milestone-4.1-Windows-binary.zip -CompressionLevel Optimal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TFE-Coop-Milestone-4.1-Windows
+          path: TFE-Coop-Milestone-4.1-Windows-binary.zip
+          if-no-files-found: error

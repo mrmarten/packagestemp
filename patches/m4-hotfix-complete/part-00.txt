@@ -1,0 +1,1 @@
+$(cat /mnt/data/work_m4_fullpatch/chunks/part-00.txt)

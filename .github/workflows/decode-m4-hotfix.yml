@@ -1,0 +1,61 @@
+name: Decode TFE M4 hotfix patch
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  decode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decode every candidate patch bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, lzma, traceback
+          from pathlib import Path
+
+          out = Path('decoded')
+          out.mkdir(exist_ok=True)
+          manifest = []
+          report = []
+          successes = 0
+          for src in sorted(Path('patches').glob('m4-hotfix*')):
+              parts = sorted(src.glob('part-*.txt'))
+              if not parts:
+                  continue
+              prefix = src.name
+              try:
+                  raw_text = ''.join(p.read_text(encoding='utf-8') for p in parts)
+                  compact = ''.join(raw_text.split())
+                  b64_path = out / f'{prefix}.patch.xz.b64'
+                  xz_path = out / f'{prefix}.patch.xz'
+                  patch_path = out / f'{prefix}.patch'
+                  b64_path.write_text(compact, encoding='ascii')
+                  compressed = base64.b64decode(compact, validate=True)
+                  xz_path.write_bytes(compressed)
+                  patch = lzma.decompress(compressed)
+                  patch_path.write_bytes(patch)
+                  for p in (b64_path, xz_path, patch_path):
+                      manifest.append(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p}")
+                  report.append(f'PASS {prefix}: parts={len(parts)} patch_bytes={len(patch)}')
+                  successes += 1
+              except Exception as exc:
+                  report.append(f'FAIL {prefix}: {type(exc).__name__}: {exc}')
+          (out / 'SHA256SUMS.txt').write_text('\n'.join(manifest) + '\n', encoding='ascii')
+          (out / 'REPORT.txt').write_text('\n'.join(report) + '\n', encoding='utf-8')
+          print('\n'.join(report))
+          if successes == 0:
+              raise SystemExit('No patch bundle decoded successfully')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: decoded-m4-hotfix-candidates
+          path: decoded/
+          if-no-files-found: error
+          retention-days: 1

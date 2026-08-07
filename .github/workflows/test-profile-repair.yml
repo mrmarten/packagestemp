@@ -1,0 +1,88 @@
+name: Test TFE co-op profile repair
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-profile-repair:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode exact repair script
+        shell: pwsh
+        run: |
+          $encoded = (Get-Content profile-repair-test/Repair-TFE-Coop-Profiles.ps1.xz.b64 -Raw).Trim()
+          [IO.File]::WriteAllBytes('repair-script.xz', [Convert]::FromBase64String($encoded))
+          @'
+          import lzma
+          from pathlib import Path
+          Path('Repair-TFE-Coop-Profiles.ps1').write_bytes(lzma.decompress(Path('repair-script.xz').read_bytes()))
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to decode repair script.' }
+          $hash = (Get-FileHash Repair-TFE-Coop-Profiles.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne '2b0003c1cae1e5890ade23d8b7080fb9371d2f8e08d13d0dfa6ea4e4fca49cbb') {
+            throw "Repair script checksum mismatch: $hash"
+          }
+
+      - name: Parse with Windows PowerShell
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\Repair-TFE-Coop-Profiles.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Force
+            throw 'PowerShell parser reported syntax errors.'
+          }
+          Write-Host 'Windows PowerShell syntax: PASS'
+
+      - name: Exercise profile creation and System32 invocation
+        shell: powershell
+        run: |
+          $package = Join-Path $PWD 'test-package'
+          $game = Join-Path $PWD 'test-game'
+          New-Item -ItemType Directory -Path $package,(Join-Path $game 'LFD') -Force | Out-Null
+          Copy-Item .\Repair-TFE-Coop-Profiles.ps1 (Join-Path $package 'Repair-TFE-Coop-Profiles.ps1')
+          foreach ($file in @('DARK.GOB','SOUNDS.GOB','SPRITES.GOB','TEXTURES.GOB')) {
+            Set-Content -LiteralPath (Join-Path $game $file) -Value 'test' -Encoding Ascii
+          }
+          Set-Content -LiteralPath (Join-Path $game 'LFD\AGENTMNU.LFD') -Value 'test' -Encoding Ascii
+
+          $documents = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+          foreach ($profile in @('Host','Client')) {
+            Remove-Item -LiteralPath (Join-Path $documents "TheForceEngine-Coop-$profile") -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          Push-Location C:\Windows\System32
+          try {
+            & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+              -File (Join-Path $package 'Repair-TFE-Coop-Profiles.ps1') `
+              -GameDir $game -NonInteractive -Quiet
+            if ($LASTEXITCODE -ne 0) { throw "Repair script returned $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+
+          $expectedSourcePath = (($game -replace '\\','/') + '/')
+          foreach ($profile in @('Host','Client')) {
+            $settings = Join-Path $documents "TheForceEngine-Coop-$profile\settings.ini"
+            if (-not (Test-Path -LiteralPath $settings -PathType Leaf)) {
+              throw "Missing generated settings: $settings"
+            }
+            $content = Get-Content -LiteralPath $settings -Raw
+            if ($content -notmatch '(?im)^\[Dark_Forces\]\s*$') { throw "Missing Dark_Forces section in $settings" }
+            if ($content -notmatch '(?im)^sourcePath\s*=') { throw "Missing sourcePath in $settings" }
+            if ($content -notmatch [regex]::Escape($expectedSourcePath)) {
+              throw "Incorrect sourcePath in $settings`n$content"
+            }
+          }
+          Write-Host 'System32 absolute invocation and Host/Client profile creation: PASS'

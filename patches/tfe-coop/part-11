@@ -1,0 +1,190 @@
+diff --git a/TheForceEngine/TFE_DarkForces/Coop/coopTransport.h b/TheForceEngine/TFE_DarkForces/Coop/coopTransport.h
+new file mode 100644
+index 0000000..8483725
+--- /dev/null
++++ b/TheForceEngine/TFE_DarkForces/Coop/coopTransport.h
+@@ -0,0 +1,42 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++
++namespace TFE_Coop
++{
++	struct Endpoint
++	{
++		std::uint32_t address = 0; // IPv4 address, network byte order.
++		std::uint16_t port = 0;    // Port, network byte order.
++		bool valid = false;
++	};
++
++	bool endpointEquals(const Endpoint& a, const Endpoint& b);
++	std::string endpointToString(const Endpoint& endpoint);
++	bool resolveEndpoint(const char* host, std::uint16_t port, Endpoint& out);
++
++	class UdpSocket
++	{
++	public:
++		UdpSocket() = default;
++		~UdpSocket();
++		UdpSocket(const UdpSocket&) = delete;
++		UdpSocket& operator=(const UdpSocket&) = delete;
++
++		bool open(std::uint16_t bindPort);
++		void close();
++		bool isOpen() const;
++		bool send(const Endpoint& endpoint, const std::uint8_t* data, std::size_t size);
++		int receive(Endpoint& endpoint, std::uint8_t* data, std::size_t capacity);
++		std::uint16_t localPort() const { return m_localPort; }
++		const std::string& lastError() const { return m_lastError; }
++
++	private:
++		std::uintptr_t m_socket = static_cast<std::uintptr_t>(-1);
++		std::uint16_t m_localPort = 0;
++		std::string m_lastError;
++		bool m_platformReady = false;
++	};
++}
+diff --git a/TheForceEngine/TFE_DarkForces/darkForcesMain.cpp b/TheForceEngine/TFE_DarkForces/darkForcesMain.cpp
+index 205cdb4..9bae8a5 100644
+--- a/TheForceEngine/TFE_DarkForces/darkForcesMain.cpp
++++ b/TheForceEngine/TFE_DarkForces/darkForcesMain.cpp
+@@ -1,6 +1,7 @@
+ #include <cstring>
+ 
+ #include "darkForcesMain.h"
++#include "Coop/coop.h"
+ #include "agent.h"
+ #include "automap.h"
+ #include "config.h"
+@@ -349,6 +350,7 @@ namespace TFE_DarkForces
+ 
+ 	void DarkForces::exitGame()
+ 	{
++		TFE_Coop::missionEnd();
+ 		if (s_sharedState.gameStarted)
+ 		{
+ 			saveLevelStatus();
+diff --git a/TheForceEngine/TFE_DarkForces/mission.cpp b/TheForceEngine/TFE_DarkForces/mission.cpp
+index e8c317c..ac44aed 100644
+--- a/TheForceEngine/TFE_DarkForces/mission.cpp
++++ b/TheForceEngine/TFE_DarkForces/mission.cpp
+@@ -12,6 +12,7 @@
+ #include "projectile.h"
+ #include "weapon.h"
+ #include "darkForcesMain.h"
++#include "Coop/coop.h"
+ #include <TFE_DarkForces/Actor/actor.h>
+ #include <TFE_DarkForces/GameUI/escapeMenu.h>
+ #include <TFE_DarkForces/GameUI/pda.h>
+@@ -459,6 +460,10 @@ namespace TFE_DarkForces
+ 				hud_startup(JTRUE);
+ 				reticle_enable(true);
+ 			}
++			if (s_missionMode == MISSION_MODE_MAIN && s_playerObject)
++			{
++				TFE_Coop::missionBegin();
++			}
+ 			s_loadingFromSave = JFALSE;
+ 			TFE_Input::clearAccumulatedMouseMove();
+ 
+@@ -469,6 +474,7 @@ namespace TFE_DarkForces
+ 		task_yield(TASK_SLEEP);
+ 
+ 		// Cleanup - shut down all tasks.
++		TFE_Coop::missionEnd();
+ 		task_freeAll();
+ 
+ 		// End the task.
+@@ -595,6 +601,7 @@ namespace TFE_DarkForces
+ 			s_prevTick  = s_curTick;
+ 			s_prevTickFract = s_curTickFract;
+ 			s_playerTick = s_curTick;
++			if (s_missionMode == MISSION_MODE_MAIN) { TFE_Coop::missionUpdate(); }
+ 
+ 			if (!escapeMenu_isOpen() && !pda_isOpen() && !cutscene_isPlaying())
+ 			{
+diff --git a/TheForceEngine/TFE_DarkForces/player.cpp b/TheForceEngine/TFE_DarkForces/player.cpp
+index 5fa4981..49912ee 100644
+--- a/TheForceEngine/TFE_DarkForces/player.cpp
++++ b/TheForceEngine/TFE_DarkForces/player.cpp
+@@ -11,6 +11,7 @@
+ #include "mission.h"
+ #include "pickup.h"
+ #include "weapon.h"
++#include "Coop/coop.h"
+ #include <TFE_System/system.h>
+ #include <TFE_FrontEndUI/console.h>
+ #include <TFE_Settings/settings.h>
+@@ -2780,19 +2781,21 @@ namespace TFE_DarkForces
+ 		}
+ 	}
+ 
+-	void handlePlayerUseAction()
++	void player_useActionForObject(SecObject* player, fixed16_16 dirX, fixed16_16 dirZ)
+ 	{
+-		SecObject* player = s_playerObject;
++		if (!player || !player->sector) { return; }
+ 		RSector* sector = player->sector;
++		const u32 originalEntityFlags = player->entityFlags;
++		player->entityFlags |= ETFLAG_PLAYER;
+ 
+ 		// Trigger the sector the player is standing in.
+-		message_sendToSector(sector, s_playerObject, INF_EVENT_NUDGE_FRONT, MSG_TRIGGER);
++		message_sendToSector(sector, player, INF_EVENT_NUDGE_FRONT, MSG_TRIGGER);
+ 
+ 		// Then cast a ray and see if the wall in front of the player is close enough to trigger.
+ 		fixed16_16 x0 = player->posWS.x;
+ 		fixed16_16 z0 = player->posWS.z;
+-		fixed16_16 x1 = x0 + mul16(FIXED(4), s_playerLogic.dir.x);
+-		fixed16_16 z1 = z0 + mul16(FIXED(4), s_playerLogic.dir.z);
++		fixed16_16 x1 = x0 + mul16(FIXED(4), dirX);
++		fixed16_16 z1 = z0 + mul16(FIXED(4), dirZ);
+ 		RWall* wall = collision_wallCollisionFromPath(sector, x0, z0, x1, z1);
+ 		if (wall)
+ 		{
+@@ -2806,9 +2809,9 @@ namespace TFE_DarkForces
+ 
+ 				// Nudge the wall.
+ 				fixed16_16 distFromW0 = vec2Length(wall->w0->x - x, wall->w0->z - z);
+-				inf_wallAndMirrorSendMessageAtPos(wall, s_playerObject, INF_EVENT_NUDGE_FRONT, distFromW0, eyeHeight);
++				inf_wallAndMirrorSendMessageAtPos(wall, player, INF_EVENT_NUDGE_FRONT, distFromW0, eyeHeight);
+ 				// Nudge the next sector from the outside.
+-				message_sendToSector(nextSector, s_playerObject, INF_EVENT_NUDGE_BACK, MSG_TRIGGER);
++				message_sendToSector(nextSector, player, INF_EVENT_NUDGE_BACK, MSG_TRIGGER);
+ 				// Set the sector collision frame to avoid infinite loops.
+ 				nextSector->collisionFrame = s_collisionFrameWall;
+ 
+@@ -2824,7 +2827,7 @@ namespace TFE_DarkForces
+ 							// Trigger the next wall.
+ 							collision_getHitPoint(&x, &z);
+ 							distFromW0 = vec2Length(wall->w0->x - x, wall->w0->z - z);
+-							inf_wallAndMirrorSendMessageAtPos(wall, s_playerObject, INF_EVENT_NUDGE_FRONT, distFromW0, eyeHeight);
++							inf_wallAndMirrorSendMessageAtPos(wall, player, INF_EVENT_NUDGE_FRONT, distFromW0, eyeHeight);
+ 
+ 							nextSector = wall->nextSector;
+ 							if (nextSector)
+@@ -2832,7 +2835,7 @@ namespace TFE_DarkForces
+ 								if (s_collisionFrameWall != nextSector->collisionFrame)
+ 								{
+ 									// Nudge the next sector from the outside.
+-									message_sendToSector(nextSector, s_playerObject, INF_EVENT_NUDGE_BACK, MSG_TRIGGER);
++									message_sendToSector(nextSector, player, INF_EVENT_NUDGE_BACK, MSG_TRIGGER);
+ 									nextSector->collisionFrame = s_collisionFrameWall;
+ 								}
+ 								// Make sure the eye ray fits in the opening.
+@@ -2855,9 +2858,16 @@ namespace TFE_DarkForces
+ 				collision_getHitPoint(&x, &z);
+ 
+ 				s32 distFromW0 = vec2Length(wall->w0->x - x, wall->w0->z - z);
+-				inf_wallAndMirrorSendMessageAtPos(wall, s_playerObject, INF_EVENT_NUDGE_FRONT, distFromW0, eyeHeight);
++				inf_wallAndMirrorSendMessageAtPos(wall, player, INF_EVENT_NUDGE_FRONT, distFromW0, eyeHeight);
+ 			}
+ 		}
++		player->entityFlags = originalEntityFlags;
++	}
++
++	void handlePlayerUseAction()
++	{
++		player_useActionForObject(s_playerObject, s_playerLogic.dir.x, s_playerLogic.dir.z);

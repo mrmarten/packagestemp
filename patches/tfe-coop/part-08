@@ -1,0 +1,219 @@
++			processWelcome(endpoint, packet, nowMs);
++			return;
++		}
++		processConnectedPacket(endpoint, packet, nowMs);
++	}
++
++	void Session::processHello(const Endpoint& endpoint, const Protocol::PacketView& packet, std::uint64_t nowMs)
++	{
++		if (m_config.role != Role::Host ||
++			(m_state != ConnectionState::Listening && m_state != ConnectionState::Connected))
++		{
++			m_stats.ignoredPackets++;
++			return;
++		}
++		Protocol::Hello hello;
++		if (!Protocol::decodeHello(packet, hello) || packet.header.sessionId != 0 || !hello.nonce)
++		{
++			m_stats.malformedPackets++;
++			return;
++		}
++		if (m_state == ConnectionState::Connected)
++		{
++			if (endpointEquals(endpoint, m_peer) && hello.nonce == m_remoteNonce)
++			{
++				sendWelcome(endpoint, hello.nonce, true, RejectNone);
++				m_lastReceiveMs = nowMs;
++			}
++			else
++			{
++				sendWelcome(endpoint, hello.nonce, false, RejectSessionFull);
++			}
++			return;
++		}
++		if (hello.contentHash != m_config.contentHash)
++		{
++			sendWelcome(endpoint, hello.nonce, false, RejectContentMismatch);
++			return;
++		}
++		m_peer = endpoint;
++		m_remoteNonce = hello.nonce;
++		m_remotePlayerName = hello.playerName;
++		m_sessionId = generateId();
++		m_error.clear();
++		m_state = ConnectionState::Connected;
++		m_lastReceiveMs = nowMs;
++		m_lastStateSendMs = 0;
++		m_lastPingMs = 0;
++		sendWelcome(endpoint, hello.nonce, true, RejectNone);
++	}
++
++	void Session::processWelcome(const Endpoint& endpoint, const Protocol::PacketView& packet, std::uint64_t nowMs)
++	{
++		if (m_config.role != Role::Client || m_state != ConnectionState::Connecting || !endpointEquals(endpoint, m_peer))
++		{
++			m_stats.ignoredPackets++;
++			return;
++		}
++		Protocol::Welcome welcome;
++		if (!Protocol::decodeWelcome(packet, welcome) || welcome.nonce != m_localNonce)
++		{
++			m_stats.malformedPackets++;
++			return;
++		}
++		if (!welcome.accepted)
++		{
++			m_state = ConnectionState::Rejected;
++			if (welcome.reason == RejectContentMismatch) { m_error = "Co-op content/build hash differs from the host"; }
++			else if (welcome.reason == RejectSessionFull) { m_error = "The co-op host already has a client"; }
++			else { m_error = "The co-op host rejected the connection"; }
++			m_socket.close();
++			return;
++		}
++		if (!packet.header.sessionId)
++		{
++			m_stats.malformedPackets++;
++			return;
++		}
++		m_sessionId = packet.header.sessionId;
++		m_error.clear();
++		m_state = ConnectionState::Connected;
++		m_lastReceiveMs = nowMs;
++		m_lastStateSendMs = 0;
++		m_lastPingMs = 0;
++	}
++
++	void Session::processConnectedPacket(const Endpoint& endpoint, const Protocol::PacketView& packet, std::uint64_t nowMs)
++	{
++		if (m_state != ConnectionState::Connected || !endpointEquals(endpoint, m_peer) || packet.header.sessionId != m_sessionId)
++		{
++			m_stats.ignoredPackets++;
++			return;
++		}
++		m_lastReceiveMs = nowMs;
++		switch (packet.header.type)
++		{
++			case Protocol::PacketType::PlayerState:
++			{
++				Protocol::PlayerState state;
++				if (!Protocol::decodePlayerState(packet, state)) { m_stats.malformedPackets++; break; }
++				if (!m_haveRemoteStateSequence || sequenceNewer(packet.header.sequence, m_lastRemoteStateSequence))
++				{
++					m_lastRemoteStateSequence = packet.header.sequence;
++					m_haveRemoteStateSequence = true;
++					m_remotePlayerState = state;
++					m_haveRemotePlayerState = true;
++				}
++			} break;
++			case Protocol::PacketType::ProjectileEvent:
++			{
++				Protocol::ProjectileEvent event;
++				if (!Protocol::decodeProjectileEvent(packet, event) || !event.eventId) { m_stats.malformedPackets++; break; }
++				sendAck(packet.header.type, event.eventId);
++				if (rememberReliable(packet.header.type, event.eventId))
++				{
++					if (m_projectileEvents.size() >= MaxQueuedEvents) { m_projectileEvents.pop_front(); }
++					m_projectileEvents.push_back(event);
++				}
++			} break;
++			case Protocol::PacketType::UseEvent:
++			{
++				Protocol::UseEvent event;
++				if (!Protocol::decodeUseEvent(packet, event) || !event.eventId) { m_stats.malformedPackets++; break; }
++				sendAck(packet.header.type, event.eventId);
++				if (rememberReliable(packet.header.type, event.eventId))
++				{
++					if (m_useEvents.size() >= MaxQueuedEvents) { m_useEvents.pop_front(); }
++					m_useEvents.push_back(event);
++				}
++			} break;
++			case Protocol::PacketType::Ack:
++			{
++				Protocol::Ack ack;
++				if (!Protocol::decodeAck(packet, ack)) { m_stats.malformedPackets++; break; }
++				acknowledgeReliable(ack.acknowledgedType, ack.eventId);
++			} break;
++			case Protocol::PacketType::Ping:
++			{
++				Protocol::Ping ping;
++				if (!Protocol::decodePing(packet, ping)) { m_stats.malformedPackets++; break; }
++				sendPong(ping);
++			} break;
++			case Protocol::PacketType::Pong:
++			{
++				Protocol::Ping ping;
++				if (!Protocol::decodePing(packet, ping)) { m_stats.malformedPackets++; break; }
++				if (nowMs >= ping.timestampMs)
++				{
++					const std::uint64_t rtt = nowMs - ping.timestampMs;
++					m_stats.roundTripTimeMs = static_cast<std::uint32_t>(std::min<std::uint64_t>(rtt, 0xffffffffu));
++				}
++			} break;
++			case Protocol::PacketType::Disconnect:
++			{
++				std::uint16_t reason;
++				if (!Protocol::decodeDisconnect(packet, reason)) { m_stats.malformedPackets++; break; }
++				(void)reason;
++				resetPeerState();
++				if (m_config.role == Role::Host)
++				{
++					m_state = ConnectionState::Listening;
++				}
++				else
++				{
++					m_state = ConnectionState::Disconnected;
++					m_socket.close();
++				}
++			} break;
++			default:
++				m_stats.ignoredPackets++;
++				break;
++		}
++	}
++
++	void Session::serviceReliable(std::uint64_t nowMs)
++	{
++		for (std::size_t i = 0; i < m_pendingReliable.size();)
++		{
++			PendingReliable& pending = m_pendingReliable[i];
++			if (nowMs - pending.lastSentMs < ReliableRetryMs)
++			{
++				i++;
++				continue;
++			}
++			if (pending.attempts >= MaxReliableAttempts)
++			{
++				m_stats.reliableFailures++;
++				m_pendingReliable.erase(m_pendingReliable.begin() + static_cast<std::ptrdiff_t>(i));
++				continue;
++			}
++			if (sendDatagram(pending.datagram))
++			{
++				pending.lastSentMs = nowMs;
++				pending.attempts++;
++				m_stats.retransmits++;
++			}
++			i++;
++		}
++	}
++
++	bool Session::queueReliable(Protocol::PacketType type, std::uint32_t eventId, const Protocol::Datagram& datagram)
++	{
++		PendingReliable pending;
++		pending.type = type;
++		pending.eventId = eventId;
++		pending.datagram = datagram;
++		pending.lastSentMs = monotonicTimeMs();
++		pending.attempts = 1;
++		if (!sendDatagram(pending.datagram)) { return false; }
++		m_pendingReliable.push_back(pending);
++		m_stats.pendingReliable = static_cast<std::uint32_t>(m_pendingReliable.size());
++		return true;
++	}
++
++	void Session::acknowledgeReliable(Protocol::PacketType type, std::uint32_t eventId)
++	{
++		const auto it = std::find_if(m_pendingReliable.begin(), m_pendingReliable.end(),
++			[type, eventId](const PendingReliable& pending) {
++				return pending.type == type && pending.eventId == eventId;
++			});

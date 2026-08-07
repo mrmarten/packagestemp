@@ -1,0 +1,185 @@
++		useOut.y == use.y && useOut.z == use.z && useOut.yaw == use.yaw && useOut.pitch == use.pitch &&
++		useOut.sectorIndex == use.sectorIndex, "use round trip");
++
++	Ack ack;
++	ack.acknowledgedType = PacketType::UseEvent;
++	ack.eventId = 0x10203040u;
++	require(encodeAck(header(PacketType::Ack), ack, datagram), "encode ack");
++	Ack ackOut;
++	require(decodeAck(view(datagram), ackOut), "decode ack");
++	require(ackOut.acknowledgedType == ack.acknowledgedType && ackOut.eventId == ack.eventId, "ack round trip");
++
++	Ping ping;
++	ping.timestampMs = 0x0102030405060708ull;
++	require(encodePing(header(PacketType::Ping), PacketType::Ping, ping, datagram), "encode ping");
++	Ping pingOut;
++	require(decodePing(view(datagram), pingOut) && pingOut.timestampMs == ping.timestampMs, "ping round trip");
++
++	require(encodeDisconnect(header(PacketType::Disconnect), 0xbeef, datagram), "encode disconnect");
++	std::uint16_t reason = 0;
++	require(decodeDisconnect(view(datagram), reason) && reason == 0xbeef, "disconnect round trip");
++
++	Datagram corrupt = datagram;
++	corrupt.bytes[0] ^= 0xff;
++	PacketView invalid;
++	require(!decodePacket(corrupt.bytes.data(), corrupt.size, invalid), "bad magic rejected");
++	corrupt = datagram;
++	corrupt.bytes[4] = 0;
++	corrupt.bytes[5] = Version + 1;
++	require(!decodePacket(corrupt.bytes.data(), corrupt.size, invalid), "bad version rejected");
++	require(!decodePacket(datagram.bytes.data(), HeaderSize - 1, invalid), "short header rejected");
++	corrupt = datagram;
++	corrupt.bytes[18] = 0;
++	corrupt.bytes[19] = 1;
++	require(!decodePacket(corrupt.bytes.data(), corrupt.size, invalid), "nonzero reserved header rejected");
++
++	Ack invalidAck;
++	invalidAck.acknowledgedType = PacketType::PlayerState;
++	invalidAck.eventId = 7;
++	require(encodeAck(header(PacketType::Ack), invalidAck, datagram), "encode invalid ack for decoder test");
++	Ack invalidAckOut;
++	require(!decodeAck(view(datagram), invalidAckOut), "ack of unreliable packet rejected");
++
++	std::cout << "coopProtocolTest: PASS\n";
++	return 0;
++}
+diff --git a/tests/coop/coopSessionTest.cpp b/tests/coop/coopSessionTest.cpp
+new file mode 100644
+index 0000000..7b6de08
+--- /dev/null
++++ b/tests/coop/coopSessionTest.cpp
+@@ -0,0 +1,134 @@
++#include <TFE_DarkForces/Coop/coopSession.h>
++
++#include <chrono>
++#include <cstdlib>
++#include <iostream>
++#include <thread>
++
++using namespace TFE_Coop;
++
++namespace
++{
++	void require(bool condition, const char* message)
++	{
++		if (!condition)
++		{
++			std::cerr << "FAILED: " << message << '\n';
++			std::exit(1);
++		}
++	}
++
++	void pump(Session& host, Session& client, std::uint64_t durationMs)
++	{
++		const std::uint64_t end = monotonicTimeMs() + durationMs;
++		while (monotonicTimeMs() < end)
++		{
++			const std::uint64_t now = monotonicTimeMs();
++			host.update(now);
++			client.update(now);
++			std::this_thread::sleep_for(std::chrono::milliseconds(1));
++		}
++	}
++}
++
++int main()
++{
++	Session host;
++	SessionConfig hostConfig;
++	hostConfig.role = Role::Host;
++	hostConfig.port = 0;
++	hostConfig.playerName = "Host";
++	hostConfig.contentHash = 0x1234abcd;
++	require(host.start(hostConfig), "host starts");
++	require(host.state() == ConnectionState::Listening && host.localPort() != 0, "host listens on an ephemeral port");
++
++	Session client;
++	SessionConfig clientConfig;
++	clientConfig.role = Role::Client;
++	clientConfig.connectHost = "127.0.0.1";
++	clientConfig.port = host.localPort();
++	clientConfig.playerName = "Client One";
++	clientConfig.contentHash = hostConfig.contentHash;
++	require(client.start(clientConfig), "client starts");
++
++	pump(host, client, 300);
++	require(host.connected() && client.connected(), "loopback handshake connects both peers");
++	require(host.sessionId() != 0 && host.sessionId() == client.sessionId(), "session IDs agree");
++	require(host.remotePlayerName() == clientConfig.playerName, "host receives client name");
++
++	Protocol::PlayerState hostState;
++	hostState.simulationTick = 100;
++	hostState.levelHash = 0x5555aaaa;
++	hostState.x = 10;
++	hostState.y = 20;
++	hostState.z = 30;
++	hostState.yaw = 40;
++	hostState.pitch = 50;
++	hostState.sectorIndex = 6;
++	hostState.weapon = 3;
++	hostState.health = 88;
++	hostState.shields = 144;
++	hostState.triggerGoals = 5;
++	hostState.itemGoals = 7;
++	host.submitLocalPlayerState(hostState);
++
++	Protocol::PlayerState clientState = hostState;
++	clientState.simulationTick = 101;
++	clientState.x = -100;
++	clientState.weapon = 5;
++	client.submitLocalPlayerState(clientState);
++	pump(host, client, 120);
++
++	Protocol::PlayerState received;
++	require(client.consumeRemotePlayerState(received), "client receives host state");
++	require(received.x == hostState.x && received.weapon == hostState.weapon && received.triggerGoals == hostState.triggerGoals,
++		"host state values survive network transport");
++	require(host.consumeRemotePlayerState(received), "host receives client state");
++	require(received.x == clientState.x && received.weapon == clientState.weapon, "client state values survive network transport");
++
++	Protocol::ProjectileEvent projectile;
++	projectile.levelHash = hostState.levelHash;
++	projectile.x = 1000;
++	projectile.y = 2000;
++	projectile.z = 3000;
++	projectile.projectileType = 109;
++	projectile.bounceCount = -1;
++	projectile.speed = 123456;
++	projectile.damage = 654321;
++	projectile.remainingTicks = 500;
++	std::uint32_t projectileId = 0;
++	require(host.queueProjectileEvent(projectile, &projectileId) && projectileId != 0, "host queues projectile event");
++
++	Protocol::UseEvent use;
++	use.levelHash = hostState.levelHash;
++	use.x = 12;
++	use.y = 13;
++	use.z = 14;
++	std::uint32_t useId = 0;
++	require(client.queueUseEvent(use, &useId) && useId != 0, "client queues use event");
++	pump(host, client, 250);
++
++	Protocol::ProjectileEvent receivedProjectile;
++	require(client.consumeProjectileEvent(receivedProjectile), "client receives projectile event");
++	require(receivedProjectile.eventId == projectileId && receivedProjectile.projectileType == projectile.projectileType,
++		"projectile event is intact");
++	Protocol::UseEvent receivedUse;
++	require(host.consumeUseEvent(receivedUse), "host receives use event");
++	require(receivedUse.eventId == useId && receivedUse.z == use.z, "use event is intact");
++	require(host.stats().pendingReliable == 0 && client.stats().pendingReliable == 0, "reliable queues are acknowledged");
++
++	client.stop(9);
++	pump(host, client, 50);
++	require(host.state() == ConnectionState::Listening, "host returns to listening after client disconnect");
++
++	Session badClient;
++	SessionConfig badConfig = clientConfig;
++	badConfig.contentHash ^= 1;
++	require(badClient.start(badConfig), "mismatched client starts");
++	pump(host, badClient, 200);
++	require(badClient.state() == ConnectionState::Rejected, "content mismatch is rejected");
++
++	host.stop();
++	std::cout << "coopSessionTest: PASS\n";
++	return 0;
++}

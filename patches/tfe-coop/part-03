@@ -1,0 +1,187 @@
++			if (event.flags & ProjectileFlagExplodes) { projectile->flags |= PROJFLAG_EXPLODE; }
++			if (event.flags & ProjectileFlagNoScale) { projectile->flags |= PROJFLAG_DONOT_SCALE; }
++			proj_setTransform(projectile, event.pitch, event.yaw);
++		}
++
++		void applyRemoteUse(const Protocol::UseEvent& event)
++		{
++			if (event.levelHash != s_levelHash || !s_remotePlayer || !validSectorIndex(event.sectorIndex)) { return; }
++			RSector* sector = &s_levelState.sectors[event.sectorIndex];
++			if (s_remotePlayer->sector != sector)
++			{
++				sector_removeObject(s_remotePlayer);
++				sector_addObjectDirect(sector, s_remotePlayer);
++			}
++			s_remotePlayer->posWS = { event.x, event.y, event.z };
++			s_remotePlayer->yaw = static_cast<angle14_16>(event.yaw);
++			fixed16_16 dirX, dirZ;
++			sinCosFixed(event.yaw, &dirX, &dirZ);
++			player_useActionForObject(s_remotePlayer, dirX, dirZ);
++		}
++
++		void logConnectionTransition()
++		{
++			const ConnectionState current = s_session.state();
++			if (current == s_lastConnectionState) { return; }
++			s_lastConnectionState = current;
++			TFE_System::logWrite(current == ConnectionState::Error || current == ConnectionState::Rejected || current == ConnectionState::TimedOut ? LOG_ERROR : LOG_MSG,
++				"Coop", "Connection state: %s%s%s", connectionStateName(current),
++				s_session.error().empty() ? "" : " - ", s_session.error().c_str());
++			if (current != ConnectionState::Connected && s_remotePlayer) { removeRemotePlayer(); }
++		}
++	}
++
++	void configureHost(std::uint16_t port)
++	{
++		s_config.role = Role::Host;
++		s_config.port = port ? port : DefaultPort;
++		s_configured = true;
++	}
++
++	void configureClient(const char* host, std::uint16_t port)
++	{
++		s_config.role = Role::Client;
++		s_config.connectHost = (host && host[0]) ? host : "127.0.0.1";
++		s_config.port = port ? port : DefaultPort;
++		s_configured = true;
++	}
++
++	void configurePlayerName(const char* name)
++	{
++		if (name && name[0]) { s_config.playerName = name; }
++	}
++
++	void configureDebugLogging(bool enabledValue)
++	{
++		s_debugLogging = enabledValue;
++	}
++
++	bool startup(const char* buildId)
++	{
++		if (!s_configured || s_config.role == Role::Disabled) { return true; }
++		if (s_started) { return true; }
++		s_config.contentHash = calculateContentHash(buildId);
++		if (!s_session.start(s_config))
++		{
++			TFE_System::logWrite(LOG_ERROR, "Coop", "Cannot start co-op: %s", s_session.error().c_str());
++			return false;
++		}
++		s_started = true;
++		s_lastConnectionState = ConnectionState::Stopped;
++		TFE_System::logWrite(LOG_MSG, "Coop", "%s on UDP port %u; protocol %u; content hash %08x; player '%s'.",
++			s_config.role == Role::Host ? "Hosting" : "Connecting", s_config.port,
++			static_cast<u32>(Protocol::Version), s_config.contentHash, s_config.playerName.c_str());
++		logConnectionTransition();
++		return true;
++	}
++
++	void shutdown()
++	{
++		missionEnd();
++		if (s_started) { s_session.stop(); }
++		s_started = false;
++	}
++
++	void pump()
++	{
++		if (!s_started) { return; }
++		s_session.update();
++		logConnectionTransition();
++		if (s_debugLogging && s_session.connected())
++		{
++			static std::uint64_t lastLog = 0;
++			const std::uint64_t now = monotonicTimeMs();
++			if (!lastLog || now - lastLog >= 5000)
++			{
++				const SessionStats& stats = s_session.stats();
++				TFE_System::logWrite(LOG_MSG, "Coop", "RTT %u ms; packets %" PRIu64 "/%" PRIu64 "; retries %" PRIu64 "; pending %u.",
++					stats.roundTripTimeMs, stats.packetsSent, stats.packetsReceived, stats.retransmits, stats.pendingReliable);
++				lastLog = now;
++			}
++		}
++	}
++
++	bool enabled() { return s_configured && s_config.role != Role::Disabled; }
++	bool connected() { return s_started && s_session.connected(); }
++	bool isHost() { return s_config.role == Role::Host; }
++	std::uint16_t localPort() { return s_session.localPort(); }
++
++	void missionBegin()
++	{
++		if (!enabled()) { return; }
++		missionEnd();
++		const char* levelName = agent_getLevelName();
++		s_levelHash = hashStringCaseInsensitive(levelName);
++		s_missionActive = true;
++		TFE_System::logWrite(LOG_MSG, "Coop", "Mission '%s' registered with level hash %08x.", levelName ? levelName : "", s_levelHash);
++	}
++
++	void missionUpdate()
++	{
++		if (!s_missionActive || !s_started) { return; }
++		if (s_playerObject) { s_session.submitLocalPlayerState(buildLocalPlayerState()); }
++
++		Protocol::PlayerState state;
++		if (s_session.consumeRemotePlayerState(state))
++		{
++			s_remoteTarget = state;
++			s_haveRemoteTarget = true;
++			if (!isHost() && state.levelHash == s_levelHash)
++			{
++				applyGoalMask(COMPL_TRIG, state.triggerGoals);
++				applyGoalMask(COMPL_ITEM, state.itemGoals);
++			}
++		}
++		if (s_haveRemoteTarget) { updateRemotePlayer(s_remoteTarget); }
++
++		Protocol::ProjectileEvent projectile;
++		while (s_session.consumeProjectileEvent(projectile)) { spawnRemoteProjectile(projectile); }
++		Protocol::UseEvent use;
++		while (s_session.consumeUseEvent(use)) { applyRemoteUse(use); }
++	}
++
++	void missionEnd()
++	{
++		if (!s_missionActive && !s_remotePlayer) { return; }
++		removeRemotePlayer();
++		s_missionActive = false;
++		s_levelHash = 0;
++	}
++
++	void notifyLocalProjectile(TFE_DarkForces::ProjectileLogic* projectile)
++	{
++		if (!connected() || !s_missionActive || !projectile || !projectile->logic.obj) { return; }
++		if (projectile->prevObj != s_playerObject || (projectile->flags & PROJFLAG_COOP_REPLICATED)) { return; }
++		if (static_cast<s32>(projectile->type) < 0 || static_cast<u32>(projectile->type) > 0xffffu) { return; }
++		projectile->flags |= PROJFLAG_COOP_REPLICATED;
++
++		SecObject* object = projectile->logic.obj;
++		Protocol::ProjectileEvent event;
++		event.levelHash = s_levelHash;
++		event.x = object->posWS.x;
++		event.y = object->posWS.y;
++		event.z = object->posWS.z;
++		event.yaw = static_cast<std::int16_t>(object->yaw);
++		event.pitch = static_cast<std::int16_t>(object->pitch);
++		event.sectorIndex = object->sector ? static_cast<std::int16_t>(object->sector->index) : -1;
++		event.projectileType = static_cast<std::uint16_t>(projectile->type);
++		event.bounceCount = static_cast<std::int16_t>(std::max(-32768, std::min(32767, projectile->bounceCnt)));
++		event.speed = projectile->speed;
++		event.damage = projectile->dmg;
++		event.minDamage = projectile->minDmg;
++		event.remainingTicks = projectile->duration - s_curTick;
++		if (projectile->flags & PROJFLAG_EXPLODE) { event.flags |= ProjectileFlagExplodes; }
++		if (projectile->flags & PROJFLAG_DONOT_SCALE) { event.flags |= ProjectileFlagNoScale; }
++		s_session.queueProjectileEvent(event);
++	}
++
++	void notifyLocalUse(SecObject* player)
++	{
++		if (!connected() || !s_missionActive || !player || !player->sector) { return; }
++		Protocol::UseEvent event;
++		event.levelHash = s_levelHash;
++		event.x = player->posWS.x;
++		event.y = player->posWS.y;
++		event.z = player->posWS.z;
++		event.yaw = static_cast<std::int16_t>(s_playerYaw);
++		event.pitch = static_cast<std::int16_t>(s_eyePitch);

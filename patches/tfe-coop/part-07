@@ -1,0 +1,229 @@
++		m_state = ConnectionState::Stopped;
++		m_peer = {};
++		m_sessionId = 0;
++		m_pendingReliable.clear();
++		m_projectileEvents.clear();
++		m_useEvents.clear();
++		m_recentReliable.clear();
++		m_recentReliableOrder.clear();
++		m_haveRemotePlayerState = false;
++		m_haveRemoteStateSequence = false;
++		m_stats.pendingReliable = 0;
++	}
++
++	void Session::update(std::uint64_t nowMs)
++	{
++		if (!nowMs) { nowMs = monotonicTimeMs(); }
++		if (!m_socket.isOpen()) { return; }
++
++		std::uint8_t buffer[Protocol::MaxPacketSize];
++		for (int packetCount = 0; packetCount < 128; packetCount++)
++		{
++			Endpoint endpoint;
++			const int received = m_socket.receive(endpoint, buffer, sizeof(buffer));
++			if (received == 0) { break; }
++			if (received < 0)
++			{
++				setError(m_socket.lastError());
++				return;
++			}
++			m_stats.packetsReceived++;
++			processDatagram(endpoint, buffer, static_cast<std::size_t>(received), nowMs);
++			if (!m_socket.isOpen()) { break; }
++		}
++
++		if (m_state == ConnectionState::Connecting)
++		{
++			if (!m_lastHelloMs || nowMs - m_lastHelloMs >= HelloIntervalMs)
++			{
++				sendHello(nowMs);
++			}
++			if (nowMs - m_startedMs >= HandshakeTimeoutMs)
++			{
++				m_state = ConnectionState::TimedOut;
++				m_error = "Co-op host did not answer within 10 seconds";
++				m_socket.close();
++			}
++			return;
++		}
++
++		if (m_state != ConnectionState::Connected) { return; }
++		if (nowMs - m_lastReceiveMs >= PeerTimeoutMs)
++		{
++			peerTimedOut();
++			return;
++		}
++		sendPlayerState(nowMs);
++		sendPing(nowMs);
++		serviceReliable(nowMs);
++		m_stats.pendingReliable = static_cast<std::uint32_t>(m_pendingReliable.size());
++	}
++
++	void Session::submitLocalPlayerState(const Protocol::PlayerState& state)
++	{
++		m_localPlayerState = state;
++		m_haveLocalPlayerState = true;
++	}
++
++	bool Session::consumeRemotePlayerState(Protocol::PlayerState& state)
++	{
++		if (!m_haveRemotePlayerState) { return false; }
++		state = m_remotePlayerState;
++		m_haveRemotePlayerState = false;
++		return true;
++	}
++
++	bool Session::queueProjectileEvent(Protocol::ProjectileEvent event, std::uint32_t* assignedEventId)
++	{
++		if (!connected()) { return false; }
++		if (!event.eventId) { event.eventId = m_nextReliableEventId++; }
++		if (!m_nextReliableEventId) { m_nextReliableEventId = 1; }
++		Protocol::Datagram datagram;
++		if (!Protocol::encodeProjectileEvent(makeHeader(Protocol::PacketType::ProjectileEvent), event, datagram))
++		{
++			return false;
++		}
++		if (assignedEventId) { *assignedEventId = event.eventId; }
++		return queueReliable(Protocol::PacketType::ProjectileEvent, event.eventId, datagram);
++	}
++
++	bool Session::queueUseEvent(Protocol::UseEvent event, std::uint32_t* assignedEventId)
++	{
++		if (!connected()) { return false; }
++		if (!event.eventId) { event.eventId = m_nextReliableEventId++; }
++		if (!m_nextReliableEventId) { m_nextReliableEventId = 1; }
++		Protocol::Datagram datagram;
++		if (!Protocol::encodeUseEvent(makeHeader(Protocol::PacketType::UseEvent), event, datagram))
++		{
++			return false;
++		}
++		if (assignedEventId) { *assignedEventId = event.eventId; }
++		return queueReliable(Protocol::PacketType::UseEvent, event.eventId, datagram);
++	}
++
++	bool Session::consumeProjectileEvent(Protocol::ProjectileEvent& event)
++	{
++		if (m_projectileEvents.empty()) { return false; }
++		event = m_projectileEvents.front();
++		m_projectileEvents.pop_front();
++		return true;
++	}
++
++	bool Session::consumeUseEvent(Protocol::UseEvent& event)
++	{
++		if (m_useEvents.empty()) { return false; }
++		event = m_useEvents.front();
++		m_useEvents.pop_front();
++		return true;
++	}
++
++	bool Session::sendDatagram(const Protocol::Datagram& datagram)
++	{
++		if (!m_peer.valid || !datagram.size) { return false; }
++		if (!m_socket.send(m_peer, datagram.bytes.data(), datagram.size)) { return false; }
++		m_stats.packetsSent++;
++		return true;
++	}
++
++	Protocol::Header Session::makeHeader(Protocol::PacketType type, std::uint32_t sessionIdOverride)
++	{
++		Protocol::Header header;
++		header.type = type;
++		header.sessionId = sessionIdOverride ? sessionIdOverride : m_sessionId;
++		header.sequence = m_nextSequence++;
++		if (!m_nextSequence) { m_nextSequence = 1; }
++		return header;
++	}
++
++	void Session::sendHello(std::uint64_t nowMs)
++	{
++		Protocol::Hello hello;
++		hello.nonce = m_localNonce;
++		hello.contentHash = m_config.contentHash;
++		hello.playerName = m_config.playerName;
++		Protocol::Datagram datagram;
++		if (Protocol::encodeHello(makeHeader(Protocol::PacketType::Hello, 0), hello, datagram))
++		{
++			sendDatagram(datagram);
++			m_lastHelloMs = nowMs;
++		}
++	}
++
++	void Session::sendWelcome(const Endpoint& endpoint, std::uint32_t nonce, bool accepted, std::uint16_t reason)
++	{
++		const Endpoint previousPeer = m_peer;
++		m_peer = endpoint;
++		Protocol::Welcome welcome;
++		welcome.nonce = nonce;
++		welcome.playerSlot = 1;
++		welcome.accepted = accepted ? 1 : 0;
++		welcome.reason = reason;
++		Protocol::Datagram datagram;
++		const std::uint32_t responseSession = accepted ? m_sessionId : 0;
++		if (Protocol::encodeWelcome(makeHeader(Protocol::PacketType::Welcome, responseSession), welcome, datagram))
++		{
++			sendDatagram(datagram);
++		}
++		m_peer = previousPeer;
++	}
++
++	void Session::sendPlayerState(std::uint64_t nowMs)
++	{
++		if (!m_haveLocalPlayerState || (m_lastStateSendMs && nowMs - m_lastStateSendMs < StateIntervalMs)) { return; }
++		Protocol::Datagram datagram;
++		if (Protocol::encodePlayerState(makeHeader(Protocol::PacketType::PlayerState), m_localPlayerState, datagram))
++		{
++			sendDatagram(datagram);
++			m_lastStateSendMs = nowMs;
++		}
++	}
++
++	void Session::sendPing(std::uint64_t nowMs)
++	{
++		if (m_lastPingMs && nowMs - m_lastPingMs < PingIntervalMs) { return; }
++		Protocol::Ping ping;
++		ping.timestampMs = nowMs;
++		Protocol::Datagram datagram;
++		if (Protocol::encodePing(makeHeader(Protocol::PacketType::Ping), Protocol::PacketType::Ping, ping, datagram))
++		{
++			sendDatagram(datagram);
++			m_lastPingMs = nowMs;
++		}
++	}
++
++	void Session::sendPong(const Protocol::Ping& ping)
++	{
++		Protocol::Datagram datagram;
++		if (Protocol::encodePing(makeHeader(Protocol::PacketType::Pong), Protocol::PacketType::Pong, ping, datagram))
++		{
++			sendDatagram(datagram);
++		}
++	}
++
++	void Session::sendAck(Protocol::PacketType type, std::uint32_t eventId)
++	{
++		Protocol::Ack ack;
++		ack.acknowledgedType = type;
++		ack.eventId = eventId;
++		Protocol::Datagram datagram;
++		if (Protocol::encodeAck(makeHeader(Protocol::PacketType::Ack), ack, datagram))
++		{
++			sendDatagram(datagram);
++		}
++	}
++
++	void Session::processDatagram(const Endpoint& endpoint, const std::uint8_t* data, std::size_t size, std::uint64_t nowMs)
++	{
++		Protocol::PacketView packet;
++		if (!Protocol::decodePacket(data, size, packet))
++		{
++			m_stats.malformedPackets++;
++			return;
++		}
++		if (packet.header.type == Protocol::PacketType::Hello)
++		{
++			processHello(endpoint, packet, nowMs);
++			return;
++		}
++		if (packet.header.type == Protocol::PacketType::Welcome)
++		{

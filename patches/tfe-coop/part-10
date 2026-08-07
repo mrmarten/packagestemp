@@ -1,0 +1,237 @@
+diff --git a/TheForceEngine/TFE_DarkForces/Coop/coopTransport.cpp b/TheForceEngine/TFE_DarkForces/Coop/coopTransport.cpp
+new file mode 100644
+index 0000000..7d9f4ec
+--- /dev/null
++++ b/TheForceEngine/TFE_DarkForces/Coop/coopTransport.cpp
+@@ -0,0 +1,231 @@
++#include "coopTransport.h"
++
++#include <cstring>
++#include <sstream>
++
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#pragma comment(lib, "Ws2_32.lib")
++#else
++#include <arpa/inet.h>
++#include <cerrno>
++#include <fcntl.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#endif
++
++namespace TFE_Coop
++{
++	namespace
++	{
++#ifdef _WIN32
++		using NativeSocket = SOCKET;
++		static constexpr NativeSocket InvalidSocket = INVALID_SOCKET;
++		int lastSocketError() { return WSAGetLastError(); }
++		bool wouldBlock(int error) { return error == WSAEWOULDBLOCK; }
++		void closeSocket(NativeSocket socket) { closesocket(socket); }
++#else
++		using NativeSocket = int;
++		static constexpr NativeSocket InvalidSocket = -1;
++		int lastSocketError() { return errno; }
++		bool wouldBlock(int error) { return error == EAGAIN || error == EWOULDBLOCK; }
++		void closeSocket(NativeSocket socket) { ::close(socket); }
++#endif
++		NativeSocket toNative(std::uintptr_t socket) { return static_cast<NativeSocket>(socket); }
++		std::uintptr_t fromNative(NativeSocket socket) { return static_cast<std::uintptr_t>(socket); }
++
++		std::string errorText(const char* operation, int code)
++		{
++			std::ostringstream stream;
++			stream << operation << " failed (socket error " << code << ')';
++			return stream.str();
++		}
++	}
++
++	bool endpointEquals(const Endpoint& a, const Endpoint& b)
++	{
++		return a.valid && b.valid && a.address == b.address && a.port == b.port;
++	}
++
++	std::string endpointToString(const Endpoint& endpoint)
++	{
++		if (!endpoint.valid) { return "<invalid>"; }
++		in_addr address = {};
++		address.s_addr = endpoint.address;
++		char buffer[INET_ADDRSTRLEN] = {};
++		if (!inet_ntop(AF_INET, &address, buffer, sizeof(buffer))) { return "<unprintable>"; }
++		std::ostringstream stream;
++		stream << buffer << ':' << ntohs(endpoint.port);
++		return stream.str();
++	}
++
++	bool resolveEndpoint(const char* host, std::uint16_t port, Endpoint& out)
++	{
++		out = {};
++		if (!host || !host[0] || !port) { return false; }
++#ifdef _WIN32
++		WSADATA data = {};
++		if (WSAStartup(MAKEWORD(2, 2), &data) != 0) { return false; }
++#endif
++		addrinfo hints = {};
++		hints.ai_family = AF_INET;
++		hints.ai_socktype = SOCK_DGRAM;
++		addrinfo* result = nullptr;
++		const int code = getaddrinfo(host, nullptr, &hints, &result);
++		if (code == 0 && result)
++		{
++			const sockaddr_in* address = reinterpret_cast<const sockaddr_in*>(result->ai_addr);
++			out.address = address->sin_addr.s_addr;
++			out.port = htons(port);
++			out.valid = true;
++		}
++		if (result) { freeaddrinfo(result); }
++#ifdef _WIN32
++		WSACleanup();
++#endif
++		return out.valid;
++	}
++
++	UdpSocket::~UdpSocket()
++	{
++		close();
++	}
++
++	bool UdpSocket::open(std::uint16_t bindPort)
++	{
++		close();
++#ifdef _WIN32
++		WSADATA data = {};
++		if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
++		{
++			m_lastError = "WSAStartup failed";
++			return false;
++		}
++		m_platformReady = true;
++#endif
++		NativeSocket socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++		if (socket == InvalidSocket)
++		{
++			m_lastError = errorText("socket", lastSocketError());
++			close();
++			return false;
++		}
++		m_socket = fromNative(socket);
++
++		int reuse = 1;
++#ifdef _WIN32
++		setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
++		u_long nonBlocking = 1;
++		if (ioctlsocket(socket, FIONBIO, &nonBlocking) != 0)
++#else
++		setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
++		const int flags = fcntl(socket, F_GETFL, 0);
++		if (flags < 0 || fcntl(socket, F_SETFL, flags | O_NONBLOCK) < 0)
++#endif
++		{
++			m_lastError = errorText("set nonblocking", lastSocketError());
++			close();
++			return false;
++		}
++
++		sockaddr_in address = {};
++		address.sin_family = AF_INET;
++		address.sin_addr.s_addr = htonl(INADDR_ANY);
++		address.sin_port = htons(bindPort);
++		if (::bind(socket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0)
++		{
++			m_lastError = errorText("bind", lastSocketError());
++			close();
++			return false;
++		}
++
++		sockaddr_in bound = {};
++#ifdef _WIN32
++		int boundLength = sizeof(bound);
++#else
++		socklen_t boundLength = sizeof(bound);
++#endif
++		if (getsockname(socket, reinterpret_cast<sockaddr*>(&bound), &boundLength) != 0)
++		{
++			m_lastError = errorText("getsockname", lastSocketError());
++			close();
++			return false;
++		}
++		m_localPort = ntohs(bound.sin_port);
++		m_lastError.clear();
++		return true;
++	}
++
++	void UdpSocket::close()
++	{
++		NativeSocket socket = toNative(m_socket);
++		if (socket != InvalidSocket)
++		{
++			closeSocket(socket);
++		}
++		m_socket = fromNative(InvalidSocket);
++		m_localPort = 0;
++#ifdef _WIN32
++		if (m_platformReady) { WSACleanup(); }
++#endif
++		m_platformReady = false;
++	}
++
++	bool UdpSocket::isOpen() const
++	{
++		return toNative(m_socket) != InvalidSocket;
++	}
++
++	bool UdpSocket::send(const Endpoint& endpoint, const std::uint8_t* data, std::size_t size)
++	{
++		if (!isOpen() || !endpoint.valid || !data || !size || size > 65507) { return false; }
++		sockaddr_in address = {};
++		address.sin_family = AF_INET;
++		address.sin_addr.s_addr = endpoint.address;
++		address.sin_port = endpoint.port;
++#ifdef _WIN32
++		const int sent = sendto(toNative(m_socket), reinterpret_cast<const char*>(data), static_cast<int>(size), 0,
++			reinterpret_cast<const sockaddr*>(&address), sizeof(address));
++#else
++		const int sent = static_cast<int>(sendto(toNative(m_socket), data, size, 0,
++			reinterpret_cast<const sockaddr*>(&address), sizeof(address)));
++#endif
++		if (sent != static_cast<int>(size))
++		{
++			m_lastError = errorText("sendto", lastSocketError());
++			return false;
++		}
++		return true;
++	}
++
++	int UdpSocket::receive(Endpoint& endpoint, std::uint8_t* data, std::size_t capacity)
++	{
++		endpoint = {};
++		if (!isOpen() || !data || !capacity) { return -1; }
++		sockaddr_in address = {};
++#ifdef _WIN32
++		int addressLength = sizeof(address);
++		const int received = recvfrom(toNative(m_socket), reinterpret_cast<char*>(data), static_cast<int>(capacity), 0,
++			reinterpret_cast<sockaddr*>(&address), &addressLength);
++#else
++		socklen_t addressLength = sizeof(address);
++		const int received = static_cast<int>(recvfrom(toNative(m_socket), data, capacity, 0,
++			reinterpret_cast<sockaddr*>(&address), &addressLength));
++#endif
++		if (received < 0)
++		{
++			const int error = lastSocketError();
++			if (wouldBlock(error)) { return 0; }
++			m_lastError = errorText("recvfrom", error);
++			return -1;
++		}
++		endpoint.address = address.sin_addr.s_addr;
++		endpoint.port = address.sin_port;
++		endpoint.valid = true;
++		return received;
++	}
++}

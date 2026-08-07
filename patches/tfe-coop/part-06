@@ -1,0 +1,245 @@
++	};
++
++	struct PacketView
++	{
++		Header header;
++		const std::uint8_t* payload = nullptr;
++		std::size_t payloadSize = 0;
++	};
++
++	struct Hello
++	{
++		std::uint32_t nonce = 0;
++		std::uint32_t contentHash = 0;
++		std::string playerName;
++	};
++
++	struct Welcome
++	{
++		std::uint32_t nonce = 0;
++		std::uint8_t playerSlot = 0;
++		std::uint8_t accepted = 0;
++		std::uint16_t reason = 0;
++	};
++
++	struct PlayerState
++	{
++		std::uint32_t simulationTick = 0;
++		std::uint32_t levelHash = 0;
++		std::int32_t x = 0;
++		std::int32_t y = 0;
++		std::int32_t z = 0;
++		std::int16_t yaw = 0;
++		std::int16_t pitch = 0;
++		std::int16_t sectorIndex = -1;
++		std::uint8_t weapon = 0;
++		std::uint8_t flags = 0;
++		std::int16_t health = 0;
++		std::int16_t shields = 0;
++		std::uint16_t triggerGoals = 0;
++		std::uint16_t itemGoals = 0;
++	};
++
++	struct ProjectileEvent
++	{
++		std::uint32_t eventId = 0;
++		std::uint32_t levelHash = 0;
++		std::int32_t x = 0;
++		std::int32_t y = 0;
++		std::int32_t z = 0;
++		std::int16_t yaw = 0;
++		std::int16_t pitch = 0;
++		std::int16_t sectorIndex = -1;
++		std::uint16_t projectileType = 0;
++		std::int16_t bounceCount = 0;
++		std::int32_t speed = 0;
++		std::int32_t damage = 0;
++		std::int32_t minDamage = 0;
++		std::uint32_t remainingTicks = 0;
++		std::uint8_t flags = 0;
++	};
++
++	struct UseEvent
++	{
++		std::uint32_t eventId = 0;
++		std::uint32_t levelHash = 0;
++		std::int32_t x = 0;
++		std::int32_t y = 0;
++		std::int32_t z = 0;
++		std::int16_t yaw = 0;
++		std::int16_t pitch = 0;
++		std::int16_t sectorIndex = -1;
++	};
++
++	struct Ack
++	{
++		PacketType acknowledgedType = PacketType::Invalid;
++		std::uint32_t eventId = 0;
++	};
++
++	struct Ping
++	{
++		std::uint64_t timestampMs = 0;
++	};
++
++	bool decodePacket(const std::uint8_t* data, std::size_t size, PacketView& out);
++
++	bool encodeHello(const Header& header, const Hello& payload, Datagram& out);
++	bool decodeHello(const PacketView& packet, Hello& out);
++	bool encodeWelcome(const Header& header, const Welcome& payload, Datagram& out);
++	bool decodeWelcome(const PacketView& packet, Welcome& out);
++	bool encodePlayerState(const Header& header, const PlayerState& payload, Datagram& out);
++	bool decodePlayerState(const PacketView& packet, PlayerState& out);
++	bool encodeProjectileEvent(const Header& header, const ProjectileEvent& payload, Datagram& out);
++	bool decodeProjectileEvent(const PacketView& packet, ProjectileEvent& out);
++	bool encodeUseEvent(const Header& header, const UseEvent& payload, Datagram& out);
++	bool decodeUseEvent(const PacketView& packet, UseEvent& out);
++	bool encodeAck(const Header& header, const Ack& payload, Datagram& out);
++	bool decodeAck(const PacketView& packet, Ack& out);
++	bool encodePing(const Header& header, PacketType type, const Ping& payload, Datagram& out);
++	bool decodePing(const PacketView& packet, Ping& out);
++	bool encodeDisconnect(const Header& header, std::uint16_t reason, Datagram& out);
++	bool decodeDisconnect(const PacketView& packet, std::uint16_t& reason);
++}
++}
+diff --git a/TheForceEngine/TFE_DarkForces/Coop/coopSession.cpp b/TheForceEngine/TFE_DarkForces/Coop/coopSession.cpp
+new file mode 100644
+index 0000000..e86ca1f
+--- /dev/null
++++ b/TheForceEngine/TFE_DarkForces/Coop/coopSession.cpp
+@@ -0,0 +1,643 @@
++#include "coopSession.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstring>
++
++namespace TFE_Coop
++{
++	namespace
++	{
++		static constexpr std::uint64_t HelloIntervalMs = 500;
++		static constexpr std::uint64_t StateIntervalMs = 33;
++		static constexpr std::uint64_t PingIntervalMs = 1000;
++		static constexpr std::uint64_t ReliableRetryMs = 100;
++		static constexpr std::uint64_t HandshakeTimeoutMs = 10000;
++		static constexpr std::uint64_t PeerTimeoutMs = 10000;
++		static constexpr std::uint8_t MaxReliableAttempts = 40;
++		static constexpr std::size_t MaxQueuedEvents = 128;
++		static constexpr std::size_t ReliableHistorySize = 256;
++
++		std::atomic<std::uint32_t> s_idCounter(0x63f14ac5u);
++
++		std::uint32_t generateId()
++		{
++			const std::uint64_t now = monotonicTimeMs();
++			std::uint32_t value = s_idCounter.fetch_add(0x9e3779b9u, std::memory_order_relaxed);
++			value ^= static_cast<std::uint32_t>(now);
++			value ^= static_cast<std::uint32_t>(now >> 32);
++			value ^= value >> 16;
++			value *= 0x7feb352du;
++			value ^= value >> 15;
++			value *= 0x846ca68bu;
++			value ^= value >> 16;
++			return value ? value : 1u;
++		}
++
++		bool sequenceNewer(std::uint32_t sequence, std::uint32_t previous)
++		{
++			return static_cast<std::int32_t>(sequence - previous) > 0;
++		}
++
++		std::uint64_t reliableKey(Protocol::PacketType type, std::uint32_t eventId)
++		{
++			return (std::uint64_t(static_cast<std::uint8_t>(type)) << 32) | eventId;
++		}
++	}
++
++	std::uint64_t monotonicTimeMs()
++	{
++		using Clock = std::chrono::steady_clock;
++		return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
++			Clock::now().time_since_epoch()).count());
++	}
++
++	const char* connectionStateName(ConnectionState state)
++	{
++		switch (state)
++		{
++			case ConnectionState::Stopped: return "stopped";
++			case ConnectionState::Listening: return "listening";
++			case ConnectionState::Connecting: return "connecting";
++			case ConnectionState::Connected: return "connected";
++			case ConnectionState::Rejected: return "rejected";
++			case ConnectionState::TimedOut: return "timed out";
++			case ConnectionState::Disconnected: return "disconnected";
++			case ConnectionState::Error: return "error";
++		}
++		return "unknown";
++	}
++
++	Session::~Session()
++	{
++		stop();
++	}
++
++	bool Session::start(const SessionConfig& config)
++	{
++		stop();
++		m_config = config;
++		m_error.clear();
++		m_stats = {};
++		m_startedMs = monotonicTimeMs();
++		m_lastReceiveMs = m_startedMs;
++		m_localNonce = generateId();
++		m_nextSequence = 1;
++		m_nextReliableEventId = 1;
++
++		if (config.role == Role::Disabled)
++		{
++			m_state = ConnectionState::Stopped;
++			return true;
++		}
++		if (config.role == Role::Host)
++		{
++			if (!m_socket.open(config.port))
++			{
++				setError(m_socket.lastError());
++				return false;
++			}
++			m_state = ConnectionState::Listening;
++			return true;
++		}
++		if (config.role == Role::Client)
++		{
++			if (!config.port || !resolveEndpoint(config.connectHost.c_str(), config.port, m_peer))
++			{
++				setError("Could not resolve co-op host '" + config.connectHost + "'");
++				return false;
++			}
++			if (!m_socket.open(0))
++			{
++				setError(m_socket.lastError());
++				return false;
++			}
++			m_state = ConnectionState::Connecting;
++			m_lastHelloMs = 0;
++			return true;
++		}
++		setError("Invalid co-op role");
++		return false;
++	}
++
++	void Session::stop(std::uint16_t reason)
++	{
++		if (connected() && m_peer.valid && m_socket.isOpen())
++		{
++			Protocol::Datagram datagram;
++			Protocol::Header header = makeHeader(Protocol::PacketType::Disconnect);
++			if (Protocol::encodeDisconnect(header, reason, datagram))
++			{
++				sendDatagram(datagram);
++			}
++		}
++		m_socket.close();

@@ -1,0 +1,224 @@
++		if (it != m_pendingReliable.end()) { m_pendingReliable.erase(it); }
++		m_stats.pendingReliable = static_cast<std::uint32_t>(m_pendingReliable.size());
++	}
++
++	bool Session::rememberReliable(Protocol::PacketType type, std::uint32_t eventId)
++	{
++		const std::uint64_t key = reliableKey(type, eventId);
++		if (m_recentReliable.find(key) != m_recentReliable.end())
++		{
++			m_stats.duplicateReliableEvents++;
++			return false;
++		}
++		m_recentReliable.insert(key);
++		m_recentReliableOrder.push_back(key);
++		while (m_recentReliableOrder.size() > ReliableHistorySize)
++		{
++			m_recentReliable.erase(m_recentReliableOrder.front());
++			m_recentReliableOrder.pop_front();
++		}
++		return true;
++	}
++
++	void Session::resetPeerState()
++	{
++		m_peer = {};
++		m_remotePlayerName.clear();
++		m_sessionId = 0;
++		m_remoteNonce = 0;
++		m_pendingReliable.clear();
++		m_projectileEvents.clear();
++		m_useEvents.clear();
++		m_recentReliable.clear();
++		m_recentReliableOrder.clear();
++		m_haveRemotePlayerState = false;
++		m_haveRemoteStateSequence = false;
++		m_stats.pendingReliable = 0;
++	}
++
++	void Session::peerTimedOut()
++	{
++		resetPeerState();
++		m_error = "Co-op peer timed out";
++		if (m_config.role == Role::Host)
++		{
++			m_state = ConnectionState::Listening;
++		}
++		else
++		{
++			m_state = ConnectionState::TimedOut;
++			m_socket.close();
++		}
++	}
++
++	void Session::setError(const std::string& error)
++	{
++		m_error = error;
++		m_state = ConnectionState::Error;
++		m_socket.close();
++	}
++}
+diff --git a/TheForceEngine/TFE_DarkForces/Coop/coopSession.h b/TheForceEngine/TFE_DarkForces/Coop/coopSession.h
+new file mode 100644
+index 0000000..d6dcba5
+--- /dev/null
++++ b/TheForceEngine/TFE_DarkForces/Coop/coopSession.h
+@@ -0,0 +1,158 @@
++#pragma once
++
++#include "coopProtocol.h"
++#include "coopTransport.h"
++
++#include <cstdint>
++#include <deque>
++#include <string>
++#include <unordered_set>
++#include <vector>
++
++namespace TFE_Coop
++{
++	enum class Role : std::uint8_t
++	{
++		Disabled = 0,
++		Host,
++		Client,
++	};
++
++	enum class ConnectionState : std::uint8_t
++	{
++		Stopped = 0,
++		Listening,
++		Connecting,
++		Connected,
++		Rejected,
++		TimedOut,
++		Disconnected,
++		Error,
++	};
++
++	enum RejectReason : std::uint16_t
++	{
++		RejectNone = 0,
++		RejectSessionFull = 1,
++		RejectContentMismatch = 2,
++		RejectInvalidHandshake = 3,
++	};
++
++	struct SessionConfig
++	{
++		Role role = Role::Disabled;
++		std::string connectHost = "127.0.0.1";
++		std::uint16_t port = 27500;
++		std::string playerName = "Player";
++		std::uint32_t contentHash = 0;
++	};
++
++	struct SessionStats
++	{
++		std::uint64_t packetsSent = 0;
++		std::uint64_t packetsReceived = 0;
++		std::uint64_t malformedPackets = 0;
++		std::uint64_t ignoredPackets = 0;
++		std::uint64_t retransmits = 0;
++		std::uint64_t duplicateReliableEvents = 0;
++		std::uint64_t reliableFailures = 0;
++		std::uint32_t roundTripTimeMs = 0;
++		std::uint32_t pendingReliable = 0;
++	};
++
++	std::uint64_t monotonicTimeMs();
++	const char* connectionStateName(ConnectionState state);
++
++	class Session
++	{
++	public:
++		Session() = default;
++		~Session();
++		Session(const Session&) = delete;
++		Session& operator=(const Session&) = delete;
++
++		bool start(const SessionConfig& config);
++		void stop(std::uint16_t reason = 0);
++		void update(std::uint64_t nowMs = 0);
++
++		void submitLocalPlayerState(const Protocol::PlayerState& state);
++		bool consumeRemotePlayerState(Protocol::PlayerState& state);
++
++		bool queueProjectileEvent(Protocol::ProjectileEvent event, std::uint32_t* assignedEventId = nullptr);
++		bool queueUseEvent(Protocol::UseEvent event, std::uint32_t* assignedEventId = nullptr);
++		bool consumeProjectileEvent(Protocol::ProjectileEvent& event);
++		bool consumeUseEvent(Protocol::UseEvent& event);
++
++		Role role() const { return m_config.role; }
++		ConnectionState state() const { return m_state; }
++		bool connected() const { return m_state == ConnectionState::Connected; }
++		std::uint32_t sessionId() const { return m_sessionId; }
++		std::uint16_t localPort() const { return m_socket.localPort(); }
++		const std::string& remotePlayerName() const { return m_remotePlayerName; }
++		const std::string& error() const { return m_error; }
++		const SessionStats& stats() const { return m_stats; }
++
++	private:
++		struct PendingReliable
++		{
++			Protocol::PacketType type = Protocol::PacketType::Invalid;
++			std::uint32_t eventId = 0;
++			Protocol::Datagram datagram;
++			std::uint64_t lastSentMs = 0;
++			std::uint8_t attempts = 0;
++		};
++
++		bool sendDatagram(const Protocol::Datagram& datagram);
++		Protocol::Header makeHeader(Protocol::PacketType type, std::uint32_t sessionIdOverride = 0);
++		void sendHello(std::uint64_t nowMs);
++		void sendWelcome(const Endpoint& endpoint, std::uint32_t nonce, bool accepted, std::uint16_t reason);
++		void sendPlayerState(std::uint64_t nowMs);
++		void sendPing(std::uint64_t nowMs);
++		void sendPong(const Protocol::Ping& ping);
++		void sendAck(Protocol::PacketType type, std::uint32_t eventId);
++		void processDatagram(const Endpoint& endpoint, const std::uint8_t* data, std::size_t size, std::uint64_t nowMs);
++		void processHello(const Endpoint& endpoint, const Protocol::PacketView& packet, std::uint64_t nowMs);
++		void processWelcome(const Endpoint& endpoint, const Protocol::PacketView& packet, std::uint64_t nowMs);
++		void processConnectedPacket(const Endpoint& endpoint, const Protocol::PacketView& packet, std::uint64_t nowMs);
++		void serviceReliable(std::uint64_t nowMs);
++		bool queueReliable(Protocol::PacketType type, std::uint32_t eventId, const Protocol::Datagram& datagram);
++		void acknowledgeReliable(Protocol::PacketType type, std::uint32_t eventId);
++		bool rememberReliable(Protocol::PacketType type, std::uint32_t eventId);
++		void resetPeerState();
++		void peerTimedOut();
++		void setError(const std::string& error);
++
++		SessionConfig m_config;
++		ConnectionState m_state = ConnectionState::Stopped;
++		UdpSocket m_socket;
++		Endpoint m_peer;
++		std::string m_remotePlayerName;
++		std::string m_error;
++		SessionStats m_stats;
++
++		std::uint32_t m_sessionId = 0;
++		std::uint32_t m_localNonce = 0;
++		std::uint32_t m_remoteNonce = 0;
++		std::uint32_t m_nextSequence = 1;
++		std::uint32_t m_nextReliableEventId = 1;
++		std::uint32_t m_lastRemoteStateSequence = 0;
++		bool m_haveRemoteStateSequence = false;
++
++		std::uint64_t m_startedMs = 0;
++		std::uint64_t m_lastReceiveMs = 0;
++		std::uint64_t m_lastHelloMs = 0;
++		std::uint64_t m_lastStateSendMs = 0;
++		std::uint64_t m_lastPingMs = 0;
++
++		Protocol::PlayerState m_localPlayerState;
++		Protocol::PlayerState m_remotePlayerState;
++		bool m_haveLocalPlayerState = false;
++		bool m_haveRemotePlayerState = false;
++
++		std::vector<PendingReliable> m_pendingReliable;
++		std::deque<Protocol::ProjectileEvent> m_projectileEvents;
++		std::deque<Protocol::UseEvent> m_useEvents;
++		std::deque<std::uint64_t> m_recentReliableOrder;
++		std::unordered_set<std::uint64_t> m_recentReliable;
++	};
++}

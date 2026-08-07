@@ -1,0 +1,208 @@
++		else if (strcasecmp(name, "coop-connect") == 0 && !values.empty())
++		{
++			std::uint16_t port = 27500;
++			if (values.size() >= 2)
++			{
++				const unsigned long parsed = std::strtoul(values[1], nullptr, 10);
++				if (parsed > 0 && parsed <= 65535) { port = static_cast<std::uint16_t>(parsed); }
++			}
++			TFE_Coop::configureClient(values[0], port);
++			s_startupGame = Game_Dark_Forces;
++		}
++		else if (strcasecmp(name, "coop-name") == 0 && !values.empty())
++		{
++			TFE_Coop::configurePlayerName(values[0]);
++		}
++		else if (strcasecmp(name, "coop-debug") == 0)
++		{
++			TFE_Coop::configureDebugLogging(true);
++		}
+ 		else if (strcasecmp(name, "demo_logging") == 0)
+ 		{
+ 			TFE_Settings::getTempSettings()->df_demologging = true;
+diff --git a/tests/coop/build_and_run.sh b/tests/coop/build_and_run.sh
+new file mode 100755
+index 0000000..b8681bf
+--- /dev/null
++++ b/tests/coop/build_and_run.sh
+@@ -0,0 +1,48 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++BUILD_DIR="${COOP_TEST_BUILD_DIR:-${ROOT}/build/coop-tests}"
++CXX="${CXX:-c++}"
++
++mkdir -p "${BUILD_DIR}"
++
++CXXFLAGS=(
++  -std=c++14
++  -Wall
++  -Wextra
++  -Wpedantic
++  -Werror
++  -I"${ROOT}/TheForceEngine"
++)
++LDFLAGS=()
++
++if [[ "${COOP_SANITIZE:-0}" == "1" ]]; then
++  CXXFLAGS+=(
++    -O1
++    -g
++    -fno-omit-frame-pointer
++    -fsanitize=address,undefined
++  )
++  LDFLAGS+=(
++    -fsanitize=address,undefined
++  )
++fi
++
++"${CXX}" "${CXXFLAGS[@]}" \
++  "${ROOT}/tests/coop/coopProtocolTest.cpp" \
++  "${ROOT}/TheForceEngine/TFE_DarkForces/Coop/coopProtocol.cpp" \
++  "${LDFLAGS[@]}" \
++  -o "${BUILD_DIR}/coopProtocolTest"
++
++"${CXX}" "${CXXFLAGS[@]}" \
++  "${ROOT}/tests/coop/coopSessionTest.cpp" \
++  "${ROOT}/TheForceEngine/TFE_DarkForces/Coop/coopProtocol.cpp" \
++  "${ROOT}/TheForceEngine/TFE_DarkForces/Coop/coopTransport.cpp" \
++  "${ROOT}/TheForceEngine/TFE_DarkForces/Coop/coopSession.cpp" \
++  -pthread \
++  "${LDFLAGS[@]}" \
++  -o "${BUILD_DIR}/coopSessionTest"
++
++"${BUILD_DIR}/coopProtocolTest"
++"${BUILD_DIR}/coopSessionTest"
+diff --git a/tests/coop/coopProtocolTest.cpp b/tests/coop/coopProtocolTest.cpp
+new file mode 100644
+index 0000000..e29c662
+--- /dev/null
++++ b/tests/coop/coopProtocolTest.cpp
+@@ -0,0 +1,171 @@
++#include <TFE_DarkForces/Coop/coopProtocol.h>
++
++#include <cstdlib>
++#include <iostream>
++
++using namespace TFE_Coop::Protocol;
++
++namespace
++{
++	void require(bool condition, const char* message)
++	{
++		if (!condition)
++		{
++			std::cerr << "FAILED: " << message << '\n';
++			std::exit(1);
++		}
++	}
++
++	Header header(PacketType type)
++	{
++		Header h;
++		h.type = type;
++		h.flags = 3;
++		h.sessionId = 0x12345678u;
++		h.sequence = 0xfedcba98u;
++		return h;
++	}
++
++	PacketView view(const Datagram& datagram)
++	{
++		PacketView packet;
++		require(decodePacket(datagram.bytes.data(), datagram.size, packet), "packet header must decode");
++		return packet;
++	}
++}
++
++int main()
++{
++	Datagram datagram;
++	Hello hello;
++	hello.nonce = 42;
++	hello.contentHash = 0x89abcdefu;
++	hello.playerName = "Kyle Katarn";
++	require(encodeHello(header(PacketType::Hello), hello, datagram), "encode hello");
++	Hello helloOut;
++	require(decodeHello(view(datagram), helloOut), "decode hello");
++	require(helloOut.nonce == hello.nonce && helloOut.contentHash == hello.contentHash && helloOut.playerName == hello.playerName,
++		"hello round trip");
++
++	Welcome welcome;
++	welcome.nonce = 123;
++	welcome.playerSlot = 1;
++	welcome.accepted = 1;
++	welcome.reason = 0;
++	require(encodeWelcome(header(PacketType::Welcome), welcome, datagram), "encode welcome");
++	Welcome welcomeOut;
++	require(decodeWelcome(view(datagram), welcomeOut), "decode welcome");
++	require(welcomeOut.nonce == welcome.nonce && welcomeOut.playerSlot == welcome.playerSlot &&
++		welcomeOut.accepted == welcome.accepted && welcomeOut.reason == welcome.reason, "welcome round trip");
++
++	PlayerState state;
++	state.simulationTick = 14500;
++	state.levelHash = 0xaabbccddu;
++	state.x = -123456;
++	state.y = 789012;
++	state.z = -345678;
++	state.yaw = -30000;
++	state.pitch = 1234;
++	state.sectorIndex = 91;
++	state.weapon = 7;
++	state.flags = PlayerFlagMoving | PlayerFlagPrimaryFire;
++	state.health = 77;
++	state.shields = 199;
++	state.triggerGoals = 0x55aa;
++	state.itemGoals = 0xaa55;
++	require(encodePlayerState(header(PacketType::PlayerState), state, datagram), "encode player state");
++	PlayerState stateOut;
++	require(decodePlayerState(view(datagram), stateOut), "decode player state");
++	require(stateOut.simulationTick == state.simulationTick && stateOut.levelHash == state.levelHash &&
++		stateOut.x == state.x && stateOut.y == state.y && stateOut.z == state.z &&
++		stateOut.yaw == state.yaw && stateOut.pitch == state.pitch && stateOut.sectorIndex == state.sectorIndex &&
++		stateOut.weapon == state.weapon && stateOut.flags == state.flags && stateOut.health == state.health &&
++		stateOut.shields == state.shields && stateOut.triggerGoals == state.triggerGoals &&
++		stateOut.itemGoals == state.itemGoals, "player state round trip");
++
++	ProjectileEvent projectile;
++	projectile.eventId = 99;
++	projectile.levelHash = 100;
++	projectile.x = 1;
++	projectile.y = 2;
++	projectile.z = 3;
++	projectile.yaw = 4;
++	projectile.pitch = 5;
++	projectile.sectorIndex = 6;
++	projectile.projectileType = 107;
++	projectile.bounceCount = -1;
++	projectile.speed = 0x123456;
++	projectile.damage = 0x234567;
++	projectile.minDamage = 0x345678;
++	projectile.remainingTicks = 0xfedcba98u;
++	projectile.flags = 8;
++	require(encodeProjectileEvent(header(PacketType::ProjectileEvent), projectile, datagram), "encode projectile");
++	ProjectileEvent projectileOut;
++	require(decodeProjectileEvent(view(datagram), projectileOut), "decode projectile");
++	require(projectileOut.eventId == projectile.eventId && projectileOut.levelHash == projectile.levelHash &&
++		projectileOut.x == projectile.x && projectileOut.y == projectile.y && projectileOut.z == projectile.z &&
++		projectileOut.yaw == projectile.yaw && projectileOut.pitch == projectile.pitch &&
++		projectileOut.sectorIndex == projectile.sectorIndex && projectileOut.projectileType == projectile.projectileType &&
++		projectileOut.bounceCount == projectile.bounceCount && projectileOut.speed == projectile.speed &&
++		projectileOut.damage == projectile.damage && projectileOut.minDamage == projectile.minDamage &&
++		projectileOut.remainingTicks == projectile.remainingTicks && projectileOut.flags == projectile.flags,
++		"projectile round trip");
++
++	UseEvent use;
++	use.eventId = 1;
++	use.levelHash = 2;
++	use.x = 3;
++	use.y = 4;
++	use.z = 5;
++	use.yaw = 6;
++	use.pitch = 7;
++	use.sectorIndex = 8;
++	require(encodeUseEvent(header(PacketType::UseEvent), use, datagram), "encode use event");
++	UseEvent useOut;
++	require(decodeUseEvent(view(datagram), useOut), "decode use event");
++	require(useOut.eventId == use.eventId && useOut.levelHash == use.levelHash && useOut.x == use.x &&

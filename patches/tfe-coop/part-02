@@ -1,0 +1,164 @@
++				const std::uint32_t read = stream.readBuffer(buffer.data(), firstSize);
++				hash = fnv1a(buffer.data(), read, hash);
++			}
++			if (size > buffer.size())
++			{
++				const std::uint64_t tailOffset = size - buffer.size();
++				if (tailOffset <= 0x7fffffffu && stream.seek(static_cast<s32>(tailOffset), Stream::ORIGIN_START))
++				{
++					const std::uint32_t read = stream.readBuffer(buffer.data(), static_cast<u32>(buffer.size()));
++					hash = fnv1a(buffer.data(), read, hash);
++				}
++			}
++			stream.close();
++			return hash;
++		}
++
++		std::uint32_t calculateContentHash(const char* buildId)
++		{
++			std::uint32_t hash = hashStringCaseInsensitive(buildId);
++			const std::uint16_t protocolVersion = Protocol::Version;
++			hash = fnv1a(&protocolVersion, sizeof(protocolVersion), hash);
++			static const char* files[] = { "DARK.GOB", "SOUNDS.GOB", "TEXTURES.GOB", "SPRITES.GOB" };
++			for (const char* file : files) { hash = hashFileSample(file, hash); }
++			return hash ? hash : 1u;
++		}
++
++		std::uint16_t goalsToMask(s32 type)
++		{
++			std::uint16_t mask = 0;
++			for (s32 i = 0; i < NUM_COMPLETE && i < 16; i++)
++			{
++				if (s_levelState.complete[type][i]) { mask |= static_cast<std::uint16_t>(1u << i); }
++			}
++			return mask;
++		}
++
++		void applyGoalMask(s32 type, std::uint16_t mask)
++		{
++			for (s32 i = 0; i < NUM_COMPLETE && i < 16; i++)
++			{
++				s_levelState.complete[type][i] = (mask & (1u << i)) ? JTRUE : JFALSE;
++			}
++		}
++
++		bool validSectorIndex(std::int16_t index)
++		{
++			return index >= 0 && static_cast<u32>(index) < s_levelState.sectorCount && s_levelState.sectors;
++		}
++
++		void removeRemotePlayer()
++		{
++			if (s_remotePlayer)
++			{
++				freeObject(s_remotePlayer);
++				s_remotePlayer = nullptr;
++			}
++			s_haveRemoteTarget = false;
++		}
++
++		bool spawnRemotePlayer(const Protocol::PlayerState& state)
++		{
++			if (!validSectorIndex(state.sectorIndex)) { return false; }
++			SecObject* object = allocateObject();
++			if (!object) { return false; }
++
++			JediWax* wax = TFE_Sprite_Jedi::getWax("STORM1.WAX", POOL_LEVEL);
++			if (wax) { sprite_setData(object, wax); }
++			else { spirit_setData(object); }
++
++			object->entityFlags = ETFLAG_REMOTE;
++			object->flags |= OBJ_FLAG_NEEDS_TRANSFORM;
++			object->flags &= ~(OBJ_FLAG_AIM | OBJ_FLAG_MOVABLE);
++			// Keep the visual but remove object collision from the prototype ghost.
++			object->worldWidth = 0;
++			if (object->worldHeight <= 0) { object->worldHeight = FIXED(5); }
++			object->posWS = { state.x, state.y, state.z };
++			object->yaw = static_cast<angle14_16>(state.yaw);
++			object->pitch = static_cast<angle14_16>(state.pitch);
++			sector_addObjectDirect(&s_levelState.sectors[state.sectorIndex], object);
++			s_remotePlayer = object;
++			return true;
++		}
++
++		void updateRemotePlayer(const Protocol::PlayerState& state)
++		{
++			if (state.levelHash != s_levelHash || !validSectorIndex(state.sectorIndex))
++			{
++				removeRemotePlayer();
++				return;
++			}
++			if (!s_remotePlayer && !spawnRemotePlayer(state)) { return; }
++
++			RSector* targetSector = &s_levelState.sectors[state.sectorIndex];
++			if (s_remotePlayer->sector != targetSector)
++			{
++				sector_removeObject(s_remotePlayer);
++				sector_addObjectDirect(targetSector, s_remotePlayer);
++				s_remotePlayer->posWS = { state.x, state.y, state.z };
++			}
++			else
++			{
++				// Exponential smoothing hides the 30 Hz state update cadence without adding latency buffers.
++				s_remotePlayer->posWS.x += (state.x - s_remotePlayer->posWS.x) / 3;
++				s_remotePlayer->posWS.y += (state.y - s_remotePlayer->posWS.y) / 3;
++				s_remotePlayer->posWS.z += (state.z - s_remotePlayer->posWS.z) / 3;
++			}
++			s_remotePlayer->yaw = static_cast<angle14_16>(state.yaw);
++			s_remotePlayer->pitch = static_cast<angle14_16>(state.pitch);
++			s_remotePlayer->frame = 0;
++			if (state.flags & Protocol::PlayerFlagDying) { s_remotePlayer->flags &= ~OBJ_FLAG_NEEDS_TRANSFORM; }
++			else { s_remotePlayer->flags |= OBJ_FLAG_NEEDS_TRANSFORM; }
++		}
++
++		Protocol::PlayerState buildLocalPlayerState()
++		{
++			Protocol::PlayerState state;
++			state.simulationTick = s_curTick;
++			state.levelHash = s_levelHash;
++			if (!s_playerObject) { return state; }
++			state.x = s_playerObject->posWS.x;
++			state.y = s_playerObject->posWS.y;
++			state.z = s_playerObject->posWS.z;
++			state.yaw = static_cast<std::int16_t>(s_playerYaw);
++			state.pitch = static_cast<std::int16_t>(s_eyePitch);
++			state.sectorIndex = s_playerObject->sector ? static_cast<std::int16_t>(s_playerObject->sector->index) : -1;
++			state.weapon = static_cast<std::uint8_t>(std::max(0, std::min(255, s_playerInfo.curWeapon)));
++			state.health = static_cast<std::int16_t>(std::max(-32768, std::min(32767, s_playerInfo.health)));
++			state.shields = static_cast<std::int16_t>(std::max(-32768, std::min(32767, s_playerInfo.shields)));
++			state.triggerGoals = goalsToMask(COMPL_TRIG);
++			state.itemGoals = goalsToMask(COMPL_ITEM);
++			const fixed16_16 movement = TFE_Jedi::abs(s_playerVelX) + TFE_Jedi::abs(s_playerVelZ) + TFE_Jedi::abs(s_playerUpVel);
++			if (movement > 0x1000) { state.flags |= Protocol::PlayerFlagMoving; }
++			if (s_playerObject->worldHeight < FIXED(5)) { state.flags |= Protocol::PlayerFlagCrouching; }
++			if (s_playerDying) { state.flags |= Protocol::PlayerFlagDying; }
++			if (s_weaponFiring) { state.flags |= Protocol::PlayerFlagPrimaryFire; }
++			if (s_weaponFiringSec) { state.flags |= Protocol::PlayerFlagSecondaryFire; }
++			return state;
++		}
++
++		void spawnRemoteProjectile(const Protocol::ProjectileEvent& event)
++		{
++			if (event.levelHash != s_levelHash || !validSectorIndex(event.sectorIndex) || !s_remotePlayer) { return; }
++			const u32 projectileType = event.projectileType;
++			if (projectileType >= PROJ_COUNT)
++			{
++				if (projectileType < TFE_ExternalData::CUSTOM_PROJ_STARTNUM) { return; }
++				const u32 customIndex = projectileType - TFE_ExternalData::CUSTOM_PROJ_STARTNUM;
++				const std::vector<TFE_ExternalData::ExternalProjectile>* custom = TFE_ExternalData::getCustomProjectiles();
++				if (!custom || customIndex >= custom->size()) { return; }
++			}
++
++			// Do not retain the remote visual object as projectile ownership. The ghost can be
++			// removed immediately on disconnect while replicated projectiles are still active.
++			Logic* logic = createProjectile(static_cast<ProjectileType>(projectileType),
++				&s_levelState.sectors[event.sectorIndex], event.x, event.y, event.z, nullptr);
++			if (!logic) { return; }
++			TFE_DarkForces::ProjectileLogic* projectile = reinterpret_cast<TFE_DarkForces::ProjectileLogic*>(logic);
++			projectile->flags |= PROJFLAG_COOP_REPLICATED;
++			projectile->excludeObj = nullptr;
++			projectile->bounceCnt = event.bounceCount;
++			if (event.speed) { projectile->speed = event.speed; projectile->col_speed = event.speed; }
++			projectile->dmg = event.damage;
++			projectile->minDmg = event.minDamage;
++			projectile->duration = s_curTick + event.remainingTicks;

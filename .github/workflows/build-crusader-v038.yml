@@ -35,7 +35,7 @@ jobs:
           $encoded = (Get-Content -LiteralPath $part -Raw).Trim()
           [IO.File]::WriteAllBytes('kit-core.zip', [Convert]::FromBase64String($encoded))
           $actualKitHash = (Get-FileHash kit-core.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualKitHash -ne 'acee9170aa51a2b3e524a9b2ed16b1019b89271fbed26542a46dc51b1a6e223') { throw "Build-kit hash mismatch: $actualKitHash" }
+          if ($actualKitHash -ne '5946be50980bf79286ff9c80bb9412243f234e153cb94a0583592fad35769ff3') { throw "Build-kit hash mismatch: $actualKitHash" }
           Expand-Archive -LiteralPath kit-core.zip -DestinationPath kit-extracted -Force
           Move-Item -LiteralPath kit-extracted/crusader_v038_build_core -Destination kit
           if (-not (Test-Path -LiteralPath kit/apply_coop_patch.py)) { throw 'Build kit reconstruction failed.' }

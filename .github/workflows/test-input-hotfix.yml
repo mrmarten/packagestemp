@@ -1,0 +1,53 @@
+name: Test TFE local input hotfix
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-launcher-parser:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode exact Milestone 4.1.3 launcher
+        shell: pwsh
+        run: |
+          $encoded = (Get-Content input-hotfix-test/launcher-4.1.3.ps1.xz.b64 -Raw) -replace '\s',''
+          [IO.File]::WriteAllBytes('launcher.xz', [Convert]::FromBase64String($encoded))
+          @'
+          import lzma
+          from pathlib import Path
+          Path('Start-TFE-Coop-Local.ps1').write_bytes(lzma.decompress(Path('launcher.xz').read_bytes()))
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher decode failed.' }
+          $hash = (Get-FileHash Start-TFE-Coop-Local.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne 'b3401ce264018b5a00b58baeb2cd69ac5c6b3d647e1e74805e32616ef9e1bc11') {
+            throw "Launcher checksum mismatch: $hash"
+          }
+
+      - name: Parse with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\Start-TFE-Coop-Local.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Force
+            throw 'Windows PowerShell parser reported syntax errors.'
+          }
+          $text = Get-Content .\Start-TFE-Coop-Local.ps1 -Raw
+          if ($text.Contains('$controllerProfile:')) {
+            throw 'Unsafe controllerProfile interpolation remains.'
+          }
+          if (-not $text.Contains('${controllerProfile}:')) {
+            throw 'Corrected controllerProfile interpolation is missing.'
+          }
+          Write-Host 'Windows PowerShell 5.1 launcher syntax: PASS'

@@ -13,7 +13,7 @@
  
  	static Actor *getPlayerTwo();
 +	/**
-+	 * True when the item is live in the CurrentMap display list.
++	 * Return true when the item is live in the CurrentMap display list.
 +	 *
 +	 * Crusader's Item::_mapNum is NOT the world map number: it is a
 +	 * per-item data byte from the map file / usecode. I_createActorCru()

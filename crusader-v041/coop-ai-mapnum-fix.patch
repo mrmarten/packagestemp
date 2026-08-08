@@ -1,0 +1,126 @@
+--- a/engines/ultima/ultima8/world/actors/cru_coop_mover_process.h
++++ b/engines/ultima/ultima8/world/actors/cru_coop_mover_process.h
+@@ -18,6 +18,7 @@
+ namespace Ultima8 {
+ 
+ class Actor;
++class Item;
+ 
+ /**
+  * A second, local Crusader player driven by a dedicated numpad/controller keymap.
+@@ -40,6 +41,17 @@
+ 	}
+ 
+ 	static Actor *getPlayerTwo();
++	/**
++	 * True when the item is live in the CurrentMap display list.
++	 *
++	 * Crusader's Item::_mapNum is NOT the world map number: it is a
++	 * per-item data byte from the map file / usecode. I_createActorCru()
++	 * creates every mission NPC with mapnum 0, while MainActor::teleport()
++	 * and Actor::createActor() store the real map number on the two local
++	 * players. Comparing the two therefore never matches, so co-op code
++	 * must use this instead of a getMapNum() equality test.
++	 */
++	static bool isInCurrentMap(const Item *item);
+ 	static bool isPlayerTarget(const Actor *actor);
+ 	static Actor *selectEnemyTarget(const Actor *enemy, ObjId currentTarget = 0,
+ 		bool requireLineOfSight = false);
+--- a/engines/ultima/ultima8/world/actors/cru_coop_mover_process.cpp
++++ b/engines/ultima/ultima8/world/actors/cru_coop_mover_process.cpp
+@@ -69,6 +69,14 @@
+ 	return getActor(_instance->_actorId);
+ }
+ 
++bool CruCoopMoverProcess::isInCurrentMap(const Item *item) {
++	// See the comment on the declaration: getMapNum() is meaningless for
++	// usecode-spawned Crusader NPCs. EXT_INCURMAP is the flag CurrentMap
++	// itself maintains for "this item is in the current map's item lists".
++	return item && item->getParent() == 0 &&
++		item->hasExtFlags(Item::EXT_INCURMAP);
++}
++
+ bool CruCoopMoverProcess::isPlayerTarget(const Actor *actor) {
+ 	if (!actor)
+ 		return false;
+@@ -95,7 +103,7 @@
+ 		Actor *candidate = candidates[i];
+ 		if (!candidate || candidate == enemy || candidate->isDead() ||
+ 			!candidate->hasFlags(Item::FLG_FASTAREA) ||
+-			candidate->getMapNum() != enemy->getMapNum())
++			!isInCurrentMap(candidate) || !isInCurrentMap(enemy))
+ 			continue;
+ 		if (i && candidate == candidates[0])
+ 			continue;
+@@ -335,7 +343,7 @@
+ 		if (!enemy || enemy->isDead() ||
+ 			enemy->hasActorFlags(Actor::ACT_COOP_PLAYER) ||
+ 			!enemy->hasFlags(Item::FLG_FASTAREA) ||
+-			enemy->getMapNum() != mapNum ||
++			!isInCurrentMap(enemy) ||
+ 			enemy->getCurrentActivityNo() == 7)
+ 			continue;
+ 		++fastActors;
+@@ -368,7 +376,7 @@
+ 			++activeAttackers;
+ 			Actor *currentTarget = getActor(attack->getTarget());
+ 			if (!isPlayerTarget(currentTarget) || currentTarget->isDead() ||
+-				currentTarget->getMapNum() != mapNum)
++				!isInCurrentMap(currentTarget))
+ 				attack->setTarget(target->getObjId());
+ 			continue;
+ 		}
+--- a/engines/ultima/ultima8/world/actors/actor.cpp
++++ b/engines/ultima/ultima8/world/actors/actor.cpp
+@@ -1931,7 +1931,8 @@
+ bool Actor::canSeeActorForCoop(const Actor *target, bool forcombat) {
+ 	if (!target || target == this || target->isDead() ||
+ 		!target->hasFlags(Item::FLG_FASTAREA) ||
+-		target->getMapNum() != getMapNum())
++		!CruCoopMoverProcess::isInCurrentMap(target) ||
++		!CruCoopMoverProcess::isInCurrentMap(this))
+ 		return false;
+ 
+ 	Direction curdir = getDir();
+--- a/engines/ultima/ultima8/world/actors/attack_process.cpp
++++ b/engines/ultima/ultima8/world/actors/attack_process.cpp
+@@ -217,7 +217,8 @@
+ 	const bool lockValid = lockedTarget && now < _coopThreatLockUntil &&
+ 		lockedTarget->hasActorFlags(Actor::ACT_COOP_PLAYER) && !lockedTarget->isDead() &&
+ 		lockedTarget->hasFlags(Item::FLG_FASTAREA) &&
+-		lockedTarget->getMapNum() == a->getMapNum();
++		CruCoopMoverProcess::isInCurrentMap(lockedTarget) &&
++		CruCoopMoverProcess::isInCurrentMap(a);
+ 	if (lockValid)
+ 		_target = _coopThreatTarget;
+ 	else {
+@@ -228,7 +229,8 @@
+ 	Actor *target = getActor(_target);
+ 	const bool targetIsPlayer = target && CruCoopMoverProcess::isPlayerTarget(target);
+ 	const bool invalidPlayerTarget = targetIsPlayer && (target->isDead() ||
+-		!target->hasFlags(Item::FLG_FASTAREA) || target->getMapNum() != a->getMapNum());
++		!target->hasFlags(Item::FLG_FASTAREA) ||
++		!CruCoopMoverProcess::isInCurrentMap(target));
+ 	// A valid P1/P2 target remains stable while the attack tactic advances.
+ 	const bool refreshPlayerTarget = !lockValid && (_target == 0 || invalidPlayerTarget);
+ 	if (refreshPlayerTarget) {
+@@ -623,7 +625,18 @@
+ 
+ 	Actor *target = getActor(_target);
+ 	if (!target || target->isDead() || !target->hasFlags(Item::FLG_FASTAREA) ||
+-		target->getMapNum() != a->getMapNum()) {
++		!CruCoopMoverProcess::isInCurrentMap(target)) {
++		// Last-ditch fallback: never leave the NPC without a player target
++		// while a local player is actually reachable. This restores the
++		// upstream guarantee that _target defaults to the avatar.
++		Actor *fallback = CruCoopMoverProcess::selectEnemyTarget(a, 0);
++		if (fallback && fallback != target) {
++			_target = fallback->getObjId();
++			target = fallback;
++		}
++	}
++	if (!target || target->isDead() || !target->hasFlags(Item::FLG_FASTAREA) ||
++		!CruCoopMoverProcess::isInCurrentMap(target)) {
+ 		// Walk around randomly in hope of finding target
+ 		_target = 0;
+ 		if (!_isActivity9orB) {

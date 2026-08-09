@@ -272,7 +272,7 @@ jobs:
           } catch { throw "Windows loader smoke test failed: $($_.Exception.Message)" }
           finally { Pop-Location }
 
-          Get-FileHash artifact\* -Recurse -Algorithm SHA256 | Sort-Object Path | ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), $_.FullName.Substring((Resolve-Path artifact).Path.Length + 1).Replace('\\','/') } | Set-Content artifact\SHA256SUMS.txt -Encoding Ascii
+          Get-ChildItem -LiteralPath artifact -Recurse -File | Get-FileHash -Algorithm SHA256 | Sort-Object Path | ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), $_.Path.Substring((Resolve-Path artifact).Path.Length + 1).Replace('\\','/') } | Set-Content artifact\SHA256SUMS.txt -Encoding Ascii
           Get-Content artifact\DEPENDENCIES.txt
           Get-Content artifact\SHA256SUMS.txt
 

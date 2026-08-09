@@ -1,0 +1,59 @@
+name: Validate exact final TFE Co-op M4.2.6 verifier
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct and checksum exact verifier
+        shell: pwsh
+        run: |
+          $compact = (Get-Content m426-package/VERIFY-WINDOWS.ps1.xz.b64 -Raw) -replace '\s',''
+          [IO.File]::WriteAllBytes('verifier.xz', [Convert]::FromBase64String($compact))
+          if ((Get-FileHash verifier.xz -Algorithm SHA256).Hash.ToLowerInvariant() -ne '183602413525dcd9ef55fbc975017d24fdd2f32a2554dba7ccfabba07276e0aa') {
+            throw 'Verifier XZ checksum mismatch.'
+          }
+          @'
+          import hashlib, lzma
+          from pathlib import Path
+          source = lzma.decompress(Path('verifier.xz').read_bytes())
+          actual = hashlib.sha256(source).hexdigest()
+          expected = 'cda4963be292bd60c1cd636e8c984aef3ae868e40e36b6c7d5880901ce617b70'
+          if actual != expected: raise SystemExit(f'verifier checksum mismatch: {actual}')
+          Path('VERIFY-WINDOWS.ps1').write_bytes(source)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Verifier reconstruction failed.' }
+
+      - name: Parse exact verifier with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\VERIFY-WINDOWS.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Force
+            throw 'Windows PowerShell 5.1 parser reported verifier errors.'
+          }
+          $text = Get-Content .\VERIFY-WINDOWS.ps1 -Raw
+          foreach ($required in @(
+            'Milestone 4.2.6 native MSVC x64 engine: OK',
+            'HD Catmull-Rom reconstruction, anti-ringing and adaptive sharpening: OK',
+            "@('Ultra','Quality','Balanced','Performance','Classic')",
+            'Test-LauncherPreflight $layout $mode $preset',
+            'TFE-Coop-Milestone-4.2.5-Engine-Delta.patch',
+            'cubicCatmullRom','sampleHdAdaptive','bicubic = clamp(bicubic, localMin, localMax);'
+          )) {
+            if (-not $text.Contains($required)) { throw "Required verifier guard is absent: $required" }
+          }
+          Write-Host 'Exact final verifier PowerShell 5.1 parse: PASS'
